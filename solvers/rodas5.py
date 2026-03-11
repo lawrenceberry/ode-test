@@ -30,8 +30,98 @@ _C81 = 42.57076742291101;  _C82 = -13.80770672017997;  _C83 = 93.98938432427124;
 # fmt: on
 
 
+def _step(f_fn, jac_fn, y, dt):
+    """Single Rodas5 step.
+
+    Args:
+        f_fn: Callable y -> dy/dt.
+        jac_fn: Callable y -> Jacobian matrix.
+        y: Current state vector.
+        dt: Step size.
+
+    Returns:
+        (y_new, error_estimate) tuple.
+    """
+    n = y.shape[0]
+    J = jac_fn(y)
+    dtgamma = dt * _gamma
+    W = jnp.eye(n) / dtgamma - J
+    LU_piv = jax.scipy.linalg.lu_factor(W)
+    inv_dt = 1.0 / dt
+
+    # Stage 1
+    dy = f_fn(y)
+    k1 = jax.scipy.linalg.lu_solve(LU_piv, dy)
+
+    # Stage 2
+    u = y + _a21 * k1
+    du = f_fn(u)
+    k2 = jax.scipy.linalg.lu_solve(LU_piv, du + (_C21 * k1) * inv_dt)
+
+    # Stage 3
+    u = y + _a31 * k1 + _a32 * k2
+    du = f_fn(u)
+    k3 = jax.scipy.linalg.lu_solve(LU_piv, du + (_C31 * k1 + _C32 * k2) * inv_dt)
+
+    # Stage 4
+    u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
+    du = f_fn(u)
+    k4 = jax.scipy.linalg.lu_solve(
+        LU_piv, du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt
+    )
+
+    # Stage 5
+    u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
+    du = f_fn(u)
+    k5 = jax.scipy.linalg.lu_solve(
+        LU_piv,
+        du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt,
+    )
+
+    # Stage 6
+    u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
+    du = f_fn(u)
+    k6 = jax.scipy.linalg.lu_solve(
+        LU_piv,
+        du + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5) * inv_dt,
+    )
+
+    # Stage 7
+    u = u + k6
+    du = f_fn(u)
+    k7 = jax.scipy.linalg.lu_solve(
+        LU_piv,
+        du
+        + (_C71 * k1 + _C72 * k2 + _C73 * k3 + _C74 * k4 + _C75 * k5 + _C76 * k6)
+        * inv_dt,
+    )
+
+    # Stage 8
+    u = u + k7
+    du = f_fn(u)
+    k8 = jax.scipy.linalg.lu_solve(
+        LU_piv,
+        du
+        + (
+            _C81 * k1
+            + _C82 * k2
+            + _C83 * k3
+            + _C84 * k4
+            + _C85 * k5
+            + _C86 * k6
+            + _C87 * k7
+        )
+        * inv_dt,
+    )
+
+    y_new = u + k8
+    return y_new, k8
+
+
 def solve(f, y0, t_span, *, rtol=1e-8, atol=1e-10, first_step=None, max_steps=100000):
     """Solve a stiff autonomous ODE system using the Rodas5 method.
+
+    This function is JAX-jittable and vmappable (uses jax.lax.while_loop).
 
     Args:
         f: JAX function mapping state vector y -> dy/dt.
@@ -43,116 +133,78 @@ def solve(f, y0, t_span, *, rtol=1e-8, atol=1e-10, first_step=None, max_steps=10
         max_steps: Maximum number of steps.
 
     Returns:
-        Array of shape (n_components, n_time_points) with the solution.
+        Final state array of shape (n_components,).
     """
-    f_jit = jax.jit(f)
-    jac_fn = jax.jit(jax.jacobian(f))
-
-    @jax.jit
-    def step(y, dt):
-        n = y.shape[0]
-        J = jac_fn(y)
-        dtgamma = dt * _gamma
-        W = jnp.eye(n) / dtgamma - J
-        LU_piv = jax.scipy.linalg.lu_factor(W)
-        inv_dt = 1.0 / dt
-
-        # Stage 1
-        dy = f_jit(y)
-        k1 = jax.scipy.linalg.lu_solve(LU_piv, dy)
-
-        # Stage 2
-        u = y + _a21 * k1
-        du = f_jit(u)
-        k2 = jax.scipy.linalg.lu_solve(LU_piv, du + (_C21 * k1) * inv_dt)
-
-        # Stage 3
-        u = y + _a31 * k1 + _a32 * k2
-        du = f_jit(u)
-        k3 = jax.scipy.linalg.lu_solve(LU_piv, du + (_C31 * k1 + _C32 * k2) * inv_dt)
-
-        # Stage 4
-        u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
-        du = f_jit(u)
-        k4 = jax.scipy.linalg.lu_solve(
-            LU_piv, du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt
-        )
-
-        # Stage 5
-        u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
-        du = f_jit(u)
-        k5 = jax.scipy.linalg.lu_solve(
-            LU_piv,
-            du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt,
-        )
-
-        # Stage 6
-        u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
-        du = f_jit(u)
-        k6 = jax.scipy.linalg.lu_solve(
-            LU_piv,
-            du + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5) * inv_dt,
-        )
-
-        # Stage 7
-        u = u + k6
-        du = f_jit(u)
-        k7 = jax.scipy.linalg.lu_solve(
-            LU_piv,
-            du
-            + (_C71 * k1 + _C72 * k2 + _C73 * k3 + _C74 * k4 + _C75 * k5 + _C76 * k6)
-            * inv_dt,
-        )
-
-        # Stage 8
-        u = u + k7
-        du = f_jit(u)
-        k8 = jax.scipy.linalg.lu_solve(
-            LU_piv,
-            du
-            + (
-                _C81 * k1
-                + _C82 * k2
-                + _C83 * k3
-                + _C84 * k4
-                + _C85 * k5
-                + _C86 * k6
-                + _C87 * k7
-            )
-            * inv_dt,
-        )
-
-        y_new = u + k8
-        return y_new, k8
-
+    y0_arr = jnp.asarray(y0, dtype=jnp.float64)
     t0, tf = t_span
-    y = jnp.array(y0, dtype=jnp.float64)
-    dt = first_step if first_step is not None else (tf - t0) * 1e-6
-    t = t0
-    ys = [y]
+    dt0 = jnp.float64(first_step if first_step is not None else (tf - t0) * 1e-6)
+    jac_fn = jax.jacobian(f)
 
-    for _ in range(max_steps):
-        if t >= tf:
-            break
-        dt = min(dt, tf - t)
+    def cond_fn(state):
+        t, _, _, n_steps = state
+        return (t < tf) & (n_steps < max_steps)
 
-        y_new, err_est = step(y, jnp.float64(dt))
+    def body_fn(state):
+        t, y, dt, n_steps = state
+        dt = jnp.minimum(dt, tf - t)
+
+        y_new, err_est = _step(f, jac_fn, y, dt)
 
         scale = atol + rtol * jnp.maximum(jnp.abs(y), jnp.abs(y_new))
-        err_norm = float(jnp.sqrt(jnp.mean((err_est / scale) ** 2)))
+        err_norm = jnp.sqrt(jnp.mean((err_est / scale) ** 2))
 
-        if err_norm <= 1.0 and not (err_norm != err_norm):  # accept (and not NaN)
-            t += dt
-            y = y_new
-            ys.append(y)
+        accept = (err_norm <= 1.0) & ~jnp.isnan(err_norm)
+        t_new = jnp.where(accept, t + dt, t)
+        y_out = jnp.where(accept, y_new, y)
 
-        if err_norm == 0.0:
-            factor = 6.0
-        elif err_norm != err_norm or err_norm > 1e18:  # NaN or huge
-            factor = 0.2
-        else:
-            factor = min(6.0, max(0.2, 0.9 * err_norm ** (-1.0 / 6.0)))
-        dt = float(dt * factor)
+        safe_err = jnp.where(
+            jnp.isnan(err_norm) | (err_norm > 1e18),
+            1e18,
+            jnp.where(err_norm == 0.0, 1e-18, err_norm),
+        )
+        factor = jnp.clip(0.9 * safe_err ** (-1.0 / 6.0), 0.2, 6.0)
+        dt_new = dt * factor
 
-    assert t >= tf, f"Solver did not reach tf={tf} (stopped at t={t})"
-    return jnp.stack(ys).T
+        return (t_new, y_out, dt_new, n_steps + 1)
+
+    init = (jnp.float64(t0), y0_arr, dt0, jnp.int32(0))
+    _, final_y, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
+    return final_y
+
+
+def solve_ensemble(
+    f,
+    y0,
+    t_span,
+    params_batch,
+    *,
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
+):
+    """Solve an ensemble of ODEs with different parameters using vmap.
+
+    Args:
+        f: JAX function (y, params) -> dy/dt.
+        y0: Initial conditions, shared across ensemble.
+        t_span: Tuple (t0, tf), shared across ensemble.
+        params_batch: Array of shape (n_ensemble, ...) with parameters.
+        rtol: Relative tolerance.
+        atol: Absolute tolerance.
+        first_step: Initial step size (optional).
+        max_steps: Maximum number of steps.
+
+    Returns:
+        Array of shape (n_ensemble, n_components) with final states.
+    """
+
+    def _solve_one(params):
+        def f_fn(y):
+            return f(y, params)
+
+        return solve(
+            f_fn, y0, t_span, rtol=rtol, atol=atol, first_step=first_step, max_steps=max_steps
+        )
+
+    return jax.jit(jax.vmap(_solve_one))(params_batch)

@@ -41,3 +41,32 @@ def solve(f, y0, t_span, *, method="BDF", rtol=1e-8, atol=1e-10, first_step=None
     )
     assert sol.success, f"solve_ivp failed: {sol.message}"
     return jnp.array(sol.y)
+
+
+def solve_ensemble(
+    f, y0, t_span, params_batch, *, method="BDF", rtol=1e-8, atol=1e-10, first_step=None
+):
+    """Solve an ensemble of ODEs with different parameters.
+
+    Args:
+        f: JAX function (y, params) -> dy/dt.
+        y0: Initial conditions, shared across ensemble.
+        t_span: Tuple (t0, tf), shared across ensemble.
+        params_batch: Array of shape (n_ensemble, ...) with parameters.
+        method: scipy solve_ivp method (default "BDF").
+        rtol: Relative tolerance.
+        atol: Absolute tolerance.
+        first_step: Initial step size (optional).
+
+    Returns:
+        Array of shape (n_ensemble, n_components) with final states.
+    """
+    results = []
+    for params in params_batch:
+
+        def f_p(y, p=params):
+            return f(y, p)
+
+        y = solve(f_p, y0, t_span, method=method, rtol=rtol, atol=atol, first_step=first_step)
+        results.append(y[:, -1])
+    return jnp.stack(results)
