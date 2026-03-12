@@ -11,6 +11,11 @@ dependencies = [
     "scipy>=1.17.1",
 ]
 
+[project.optional-dependencies]
+gpu = [
+    "jax[cuda12]>=0.9.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
