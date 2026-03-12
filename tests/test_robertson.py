@@ -7,6 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from solvers.diffrax_kvaerno5 import solve as kvaerno5_solve
+from solvers.diffrax_kvaerno5 import solve_ensemble as kvaerno5_solve_ensemble
 from solvers.rodas5 import solve as rodas5_solve
 from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
 from solvers.scipy_bdf import solve as scipy_bdf_solve
@@ -91,6 +93,45 @@ def test_rodas5(benchmark):
     np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-4)
     np.testing.assert_allclose(y[1], 7.274753e-08, rtol=1e-4)
     np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-4)
+
+
+def test_kvaerno5(benchmark):
+    y = benchmark.pedantic(
+        jax.jit(
+            lambda: kvaerno5_solve(
+                robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
+            )
+        ),
+        warmup_rounds=1,
+        rounds=1,
+    )
+
+    # Conservation: y1 + y2 + y3 = 1 (the system is conservative)
+    np.testing.assert_allclose(y.sum(), 1.0, atol=1e-6)
+
+    # Check final state against known values
+    np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-4)
+    np.testing.assert_allclose(y[1], 7.274753e-08, rtol=1e-4)
+    np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-4)
+
+
+@pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
+def test_kvaerno5_ensemble_N(benchmark, params_batch):
+    results = benchmark.pedantic(
+        lambda: kvaerno5_solve_ensemble(
+            robertson,
+            y0=[1.0, 0.0, 0.0],
+            t_span=(0.0, 1e5),
+            params_batch=params_batch,
+            first_step=1e-4,
+        ),
+        warmup_rounds=1,
+        rounds=1,
+    )
+
+    assert results.shape == (params_batch.shape[0], 3)
+    # Conservation should hold for every member
+    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
 
 
 @pytest.mark.slow
