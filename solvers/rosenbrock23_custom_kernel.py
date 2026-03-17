@@ -8,9 +8,8 @@ with 32 trajectories per block.
 Reference: https://github.com/SciML/DiffEqGPU.jl
 """
 # TODOS:
-# 1. Instead of 3 1D blocks, use a single 2D block
-# 2. Add support for non-Robertson problems i.e. general ODEs, using jax.grad or jax.jacfwd for Jacobian and a more general kernel body
-# 3. Rewrite the rodas5_custom_kernel solver to match how the rosenbrock23 solver works i.e. batching 32 trajectories in one warp, masking out trajectories that are done.
+# 1. Add support for non-Robertson problems i.e. general ODEs, using jax.grad or jax.jacfwd for Jacobian and a more general kernel body
+# 2. Rewrite the rodas5_custom_kernel solver to match how the rosenbrock23 solver works i.e. batching 32 trajectories in one warp, masking out trajectories that are done.
 
 import functools
 import math
@@ -35,6 +34,11 @@ _sc_gamma = 0.9  # 9/10
 _qoldinit = 1.0e-4
 
 _BLOCK = 32
+
+
+def _pad_cols_pow2(n_cols):
+    """Return the next power of 2 >= n_cols."""
+    return 1 << (n_cols - 1).bit_length()  # NVIDIA GPUs run 32 identical threads (known as 1 warp) per block
 
 
 # ---------------------------------------------------------------------------
@@ -132,23 +136,24 @@ def _robertson_rb23_step(y0, y1, y2, p0, p1, p2, dt):
 
 @functools.partial(
     jax.jit,
-    static_argnames=("n_pad", "tf", "dt0", "r_tol", "a_tol", "y00", "y01", "y02", "ms"),
+    static_argnames=("n_pad", "p_cols", "y_cols", "tf", "dt0", "r_tol", "a_tol", "ms"),
 )
 def _rb23_pallas_solve(
-    p0_arr, p1_arr, p2_arr, *, n_pad, tf, dt0, r_tol, a_tol, y00, y01, y02, ms
+    params_arr, y0_arr, *, n_pad, p_cols, y_cols, tf, dt0, r_tol, a_tol, ms
 ):
     """JIT-compiled Pallas kernel call (cached across invocations)."""
 
-    def kernel_body(p0_ref, p1_ref, p2_ref, y0_ref, y1_ref, y2_ref):
-        p0 = p0_ref[...]
-        p1 = p1_ref[...]
-        p2 = p2_ref[...]
+    def kernel_body(params_ref, y0_ref, y_ref):
+        p0 = params_ref.at[:, 0][...]
+        p1 = params_ref.at[:, 1][...]
+        p2 = params_ref.at[:, 2][...]
+
+        s0 = y0_ref.at[:, 0][...]
+        s1 = y0_ref.at[:, 1][...]
+        s2 = y0_ref.at[:, 2][...]
 
         z = p0 * 0.0
         t = z + 0.0
-        s0 = z + y00
-        s1 = z + y01
-        s2 = z + y02
         dt_v = z + dt0
         qold = z + _qoldinit
 
@@ -202,27 +207,24 @@ def _rb23_pallas_solve(
             cond_fn, body_fn, (t, s0, s1, s2, dt_v, qold, jnp.int32(0))
         )
 
-        y0_ref[...] = r0
-        y1_ref[...] = r1
-        y2_ref[...] = r2
+        y_ref.at[:, 0][...] = r0
+        y_ref.at[:, 1][...] = r1
+        y_ref.at[:, 2][...] = r2
 
-    bs = pl.BlockSpec((_BLOCK,), lambda i: (i,))
+    p_bs = pl.BlockSpec((_BLOCK, p_cols), lambda i: (i, 0))
+    y_bs = pl.BlockSpec((_BLOCK, y_cols), lambda i: (i, 0))
     return pl.pallas_call(
         kernel_body,
-        out_shape=[
-            jax.ShapeDtypeStruct((n_pad,), jnp.float64),
-            jax.ShapeDtypeStruct((n_pad,), jnp.float64),
-            jax.ShapeDtypeStruct((n_pad,), jnp.float64),
-        ],
+        out_shape=jax.ShapeDtypeStruct((n_pad, y_cols), jnp.float64),
         grid=(n_pad // _BLOCK,),
-        in_specs=[bs, bs, bs],
-        out_specs=[bs, bs, bs],
+        in_specs=(p_bs, y_bs),
+        out_specs=y_bs,
         compiler_params=pltriton.CompilerParams(num_warps=1, num_stages=2),
-    )(p0_arr, p1_arr, p2_arr)
+    )(params_arr, y0_arr)
 
 
 def solve_ensemble_pallas(
-    y0,
+    y0_batch,
     t_span,
     params_batch,
     *,
@@ -236,6 +238,9 @@ def solve_ensemble_pallas(
     Uses GPURosenbrock23 algorithm matching DiffEqGPU.jl: 2-stage Rosenbrock
     with 3rd-stage error estimator and PI step size controller.
     32 trajectories per block with per-trajectory masking.
+
+    Args:
+        y0_batch: Per-trajectory initial conditions, shape (N, 3).
     """
     N = params_batch.shape[0]
     N_pad = ((N + _BLOCK - 1) // _BLOCK) * _BLOCK
@@ -244,23 +249,25 @@ def solve_ensemble_pallas(
         first_step if first_step is not None else (tf - float(t_span[0])) * 1e-6
     )
 
-    p0_arr = jnp.pad(params_batch[:, 0], (0, N_pad - N))
-    p1_arr = jnp.pad(params_batch[:, 1], (0, N_pad - N))
-    p2_arr = jnp.pad(params_batch[:, 2], (0, N_pad - N))
+    n_params = params_batch.shape[1]
+    n_vars = y0_batch.shape[1]
+    p_cols = _pad_cols_pow2(n_params)
+    y_cols = _pad_cols_pow2(n_vars)
 
-    y0_out, y1_out, y2_out = _rb23_pallas_solve(
-        p0_arr,
-        p1_arr,
-        p2_arr,
+    params_arr = jnp.pad(params_batch, ((0, N_pad - N), (0, p_cols - n_params)))
+    y0_arr = jnp.pad(y0_batch, ((0, N_pad - N), (0, y_cols - n_vars)))
+
+    y_out = _rb23_pallas_solve(
+        params_arr,
+        y0_arr,
         n_pad=N_pad,
+        p_cols=p_cols,
+        y_cols=y_cols,
         tf=tf,
         dt0=dt0,
         r_tol=float(rtol),
         a_tol=float(atol),
-        y00=float(y0[0]),
-        y01=float(y0[1]),
-        y02=float(y0[2]),
         ms=int(max_steps),
     )
 
-    return jnp.stack([y0_out[:N], y1_out[:N], y2_out[:N]], axis=1)
+    return y_out[:N, :n_vars]

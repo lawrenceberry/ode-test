@@ -240,9 +240,10 @@ def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
 
 def test_rosenbrock23_custom_kernel(benchmark):
     params_batch = _STANDARD_PARAMS[None, :]  # single-element batch
+    y0_batch = jnp.array([[1.0, 0.0, 0.0]])
     results = benchmark.pedantic(
         lambda: rb23_ck_pallas_solve_ensemble(
-            y0=[1.0, 0.0, 0.0],
+            y0_batch=y0_batch,
             t_span=(0.0, 1e5),
             params_batch=params_batch,
             first_step=1e-4,
@@ -261,9 +262,10 @@ def test_rosenbrock23_custom_kernel(benchmark):
 
 @pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
 def test_rosenbrock23_pallas_ensemble_N(benchmark, params_batch):
+    y0_batch = jnp.broadcast_to(jnp.array([1.0, 0.0, 0.0]), (params_batch.shape[0], 3))
     results = benchmark.pedantic(
         lambda: rb23_ck_pallas_solve_ensemble(
-            y0=[1.0, 0.0, 0.0],
+            y0_batch=y0_batch,
             t_span=(0.0, 1e5),
             params_batch=params_batch,
             first_step=1e-4,
