@@ -76,7 +76,13 @@ def solve_ensemble(
             return f(y, params)
 
         return solve(
-            f_fn, y0, t_span, rtol=rtol, atol=atol, first_step=first_step, max_steps=max_steps
+            f_fn,
+            y0,
+            t_span,
+            rtol=rtol,
+            atol=atol,
+            first_step=first_step,
+            max_steps=max_steps,
         )
 
     return jax.jit(jax.vmap(_solve_one))(params_batch)

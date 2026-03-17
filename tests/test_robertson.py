@@ -13,7 +13,9 @@ from solvers.rodas5 import solve as rodas5_solve
 from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
 from solvers.rodas5_custom_kernel import solve as rodas5_ck_solve
 from solvers.rodas5_custom_kernel import solve_ensemble as rodas5_ck_solve_ensemble
-from solvers.rodas5_custom_kernel import solve_ensemble_pallas as rodas5_ck_pallas_solve_ensemble
+from solvers.rodas5_custom_kernel import (
+    solve_ensemble_pallas as rodas5_ck_pallas_solve_ensemble,
+)
 from solvers.rosenbrock23_custom_kernel import make_solver as make_rb23_solver
 from solvers.scipy_bdf import solve as scipy_bdf_solve
 from solvers.scipy_bdf import solve_ensemble as scipy_bdf_solve_ensemble

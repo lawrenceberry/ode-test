@@ -148,9 +148,7 @@ def _make_rb23_step(ode_fn, n_vars):
         k3 = S(rhs3)
 
         dto6 = dt / 6.0
-        err = tuple(
-            dto6 * (k1[i] - 2.0 * k2[i] + k3[i]) for i in range(n_vars)
-        )
+        err = tuple(dto6 * (k1[i] - 2.0 * k2[i] + k3[i]) for i in range(n_vars))
 
         return u, err
 
@@ -196,13 +194,32 @@ def make_solver(ode_fn):
     @functools.partial(
         jax.jit,
         static_argnames=(
-            "n_pad", "p_cols", "y_cols", "n_vars", "n_params",
-            "tf", "dt0", "r_tol", "a_tol", "ms",
+            "n_pad",
+            "p_cols",
+            "y_cols",
+            "n_vars",
+            "n_params",
+            "tf",
+            "dt0",
+            "r_tol",
+            "a_tol",
+            "ms",
         ),
     )
     def _rb23_pallas_solve(
-        params_arr, y0_arr, *, n_pad, p_cols, y_cols, n_vars, n_params,
-        tf, dt0, r_tol, a_tol, ms,
+        params_arr,
+        y0_arr,
+        *,
+        n_pad,
+        p_cols,
+        y_cols,
+        n_vars,
+        n_params,
+        tf,
+        dt0,
+        r_tol,
+        a_tol,
+        ms,
     ):
         step_fn = _make_rb23_step(ode_fn, n_vars)
 
@@ -241,9 +258,7 @@ def make_solver(ode_fn):
                 mask = active & accept
 
                 t_new = jnp.where(mask, t + dt_use, t)
-                y_new = tuple(
-                    jnp.where(mask, u[i], y[i]) for i in range(n_vars)
-                )
+                y_new = tuple(jnp.where(mask, u[i], y[i]) for i in range(n_vars))
 
                 safe_EEst = jnp.where(
                     jnp.isnan(EEst) | (EEst > 1e18),
@@ -304,12 +319,8 @@ def make_solver(ode_fn):
         n_params = params_batch.shape[1]
 
         # Verify ODE function dimensions via JAX abstract evaluation
-        y_trace = tuple(
-            jax.ShapeDtypeStruct((), jnp.float64) for _ in range(n_vars)
-        )
-        p_trace = tuple(
-            jax.ShapeDtypeStruct((), jnp.float64) for _ in range(n_params)
-        )
+        y_trace = tuple(jax.ShapeDtypeStruct((), jnp.float64) for _ in range(n_vars))
+        p_trace = tuple(jax.ShapeDtypeStruct((), jnp.float64) for _ in range(n_params))
         out_trace = jax.eval_shape(ode_fn, y_trace, p_trace)
         assert len(out_trace) == n_vars, (
             f"ODE function returns {len(out_trace)} components but y0 has {n_vars}"

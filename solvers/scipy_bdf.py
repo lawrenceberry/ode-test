@@ -67,6 +67,8 @@ def solve_ensemble(
         def f_p(y, p=params):
             return f(y, p)
 
-        y = solve(f_p, y0, t_span, method=method, rtol=rtol, atol=atol, first_step=first_step)
+        y = solve(
+            f_p, y0, t_span, method=method, rtol=rtol, atol=atol, first_step=first_step
+        )
         results.append(y[:, -1])
     return jnp.stack(results)
