@@ -47,16 +47,19 @@ def _robertson_rb23_step(y0, y1, y2, p0, p1, p2, dt):
     """Single Rosenbrock23 step for Robertson. Returns (u0, u1, u2, e0, e1, e2)."""
     gamma = dt * _d
 
-    # Analytical Jacobian of Robertson system
-    j00 = -p0
-    j01 = p1 * y2
-    j02 = p1 * y1
-    j10 = p0
-    j11 = -p1 * y2 - 2.0 * p2 * y1
-    j12 = -p1 * y1
-    j20 = 0.0 * p0
-    j21 = 2.0 * p2 * y1
-    j22 = 0.0 * p0
+    # Robertson RHS
+    def F(s0, s1, s2):
+        return (
+            -p0 * s0 + p1 * s1 * s2,
+            p0 * s0 - p1 * s1 * s2 - p2 * s1 * s1,
+            p2 * s1 * s1,
+        )
+
+    # Jacobian of F at (y0, y1, y2) via forward-mode AD (jax.jvp)
+    ones = jnp.ones_like(y0)
+    _, (j00, j10, j20) = jax.jvp(lambda s: F(s, y1, y2), (y0,), (ones,))
+    _, (j01, j11, j21) = jax.jvp(lambda s: F(y0, s, y2), (y1,), (ones,))
+    _, (j02, j12, j22) = jax.jvp(lambda s: F(y0, y1, s), (y2,), (ones,))
 
     # W = I - gamma * J
     w00 = 1.0 - gamma * j00
@@ -89,14 +92,6 @@ def _robertson_rb23_step(y0, y1, y2, p0, p1, p2, dt):
     i20 = a20 * inv_det
     i21 = a21 * inv_det
     i22 = a22 * inv_det
-
-    # Robertson RHS
-    def F(s0, s1, s2):
-        return (
-            -p0 * s0 + p1 * s1 * s2,
-            p0 * s0 - p1 * s1 * s2 - p2 * s1 * s1,
-            p2 * s1 * s1,
-        )
 
     # W⁻¹ @ v
     def S(v0, v1, v2):
