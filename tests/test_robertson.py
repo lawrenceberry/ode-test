@@ -81,12 +81,13 @@ def test_scipy_bdf(benchmark):
 
 
 def test_rodas5(benchmark):
+    _solve = jax.jit(
+        lambda: rodas5_solve(
+            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
+        )
+    )
     y = benchmark.pedantic(
-        jax.jit(
-            lambda: rodas5_solve(
-                robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-            )
-        ),
+        lambda: _solve().block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -101,12 +102,13 @@ def test_rodas5(benchmark):
 
 
 def test_kvaerno5(benchmark):
+    _solve = jax.jit(
+        lambda: kvaerno5_solve(
+            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
+        )
+    )
     y = benchmark.pedantic(
-        jax.jit(
-            lambda: kvaerno5_solve(
-                robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-            )
-        ),
+        lambda: _solve().block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -129,7 +131,7 @@ def test_kvaerno5_ensemble_N(benchmark, params_batch):
             t_span=(0.0, 1e5),
             params_batch=params_batch,
             first_step=1e-4,
-        ),
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -160,12 +162,13 @@ def test_scipy_bdf_ensemble_N(benchmark, params_batch):
 
 
 def test_rodas5_custom_kernel(benchmark):
+    _solve = jax.jit(
+        lambda: rodas5_ck_solve(
+            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
+        )
+    )
     y = benchmark.pedantic(
-        jax.jit(
-            lambda: rodas5_ck_solve(
-                robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-            )
-        ),
+        lambda: _solve().block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -187,7 +190,7 @@ def test_rodas5_custom_kernel_ensemble_N(benchmark, params_batch):
             first_step=1e-4,
             rtol=1e-6,
             atol=1e-8,
-        ),
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -207,7 +210,7 @@ def test_rodas5_ensemble_N(benchmark, params_batch):
             first_step=1e-4,
             rtol=1e-6,
             atol=1e-8,
-        ),
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -227,7 +230,7 @@ def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
             first_step=1e-4,
             rtol=1e-6,
             atol=1e-8,
-        ),
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -237,12 +240,13 @@ def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
 
 
 def test_rosenbrock23_custom_kernel(benchmark):
+    _solve = jax.jit(
+        lambda: rb23_ck_solve(
+            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
+        )
+    )
     y = benchmark.pedantic(
-        jax.jit(
-            lambda: rb23_ck_solve(
-                robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-            )
-        ),
+        lambda: _solve().block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
@@ -262,7 +266,7 @@ def test_rosenbrock23_pallas_ensemble_N(benchmark, params_batch):
             first_step=1e-4,
             rtol=1e-6,
             atol=1e-8,
-        ),
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
