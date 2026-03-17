@@ -14,7 +14,7 @@ from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
 from solvers.rodas5_custom_kernel import solve as rodas5_ck_solve
 from solvers.rodas5_custom_kernel import solve_ensemble as rodas5_ck_solve_ensemble
 from solvers.rodas5_custom_kernel import solve_ensemble_pallas as rodas5_ck_pallas_solve_ensemble
-from solvers.rosenbrock23_custom_kernel import solve_ensemble_pallas as rb23_ck_pallas_solve_ensemble
+from solvers.rosenbrock23_custom_kernel import make_solver as make_rb23_solver
 from solvers.scipy_bdf import solve as scipy_bdf_solve
 from solvers.scipy_bdf import solve_ensemble as scipy_bdf_solve_ensemble
 
@@ -34,30 +34,33 @@ def _run_julia(n=2, rtol=1e-6, atol=1e-8, timeout=300):
 _STANDARD_PARAMS = jnp.array([0.04, 1e4, 3e7])
 
 
+def _robertson_ode(y, p):
+    """Robertson ODE right-hand side.
+
+    Stiff ODE system (Appendix A.1.3, arXiv:2304.06835).
+    Standard parameters: k1=0.04, k2=1e4, k3=3e7.
+
+    Works with tuples or arrays (uses only indexing and element-wise ops).
+    """
+    return (
+        -p[0] * y[0] + p[1] * y[1] * y[2],
+        p[0] * y[0] - p[1] * y[1] * y[2] - p[2] * y[1] * y[1],
+        p[2] * y[1] * y[1],
+    )
+
+
+@jax.jit
+def robertson(y, params=_STANDARD_PARAMS):
+    """Robertson ODE returning a JAX array (for non-Pallas solvers)."""
+    return jnp.array(_robertson_ode(y, params))
+
+
 @pytest.fixture
 def params_batch(request):
     """Robertson parameter sets with ±10% uniform perturbation."""
     N = request.param
     rng = np.random.default_rng(42)
     return jnp.array(_STANDARD_PARAMS * (1.0 + 0.1 * (2 * rng.random((N, 3)) - 1)))
-
-
-@jax.jit
-def robertson(y, params=_STANDARD_PARAMS):
-    """Robertson equation parameterized by rate constants (k1, k2, k3).
-
-    Stiff ODE system (Appendix A.1.3, arXiv:2304.06835).
-    Standard parameters: k1=0.04, k2=1e4, k3=3e7.
-    """
-    k1, k2, k3 = params
-    y1, y2, y3 = y
-    return jnp.array(
-        [
-            -k1 * y1 + k2 * y2 * y3,
-            k1 * y1 - k2 * y2 * y3 - k3 * y2**2,
-            k3 * y2**2,
-        ]
-    )
 
 
 def test_scipy_bdf(benchmark):
@@ -239,10 +242,11 @@ def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
 
 
 def test_rosenbrock23_custom_kernel(benchmark):
+    solve = make_rb23_solver(_robertson_ode)
     params_batch = _STANDARD_PARAMS[None, :]  # single-element batch
     y0_batch = jnp.array([[1.0, 0.0, 0.0]])
     results = benchmark.pedantic(
-        lambda: rb23_ck_pallas_solve_ensemble(
+        lambda: solve(
             y0_batch=y0_batch,
             t_span=(0.0, 1e5),
             params_batch=params_batch,
@@ -262,9 +266,10 @@ def test_rosenbrock23_custom_kernel(benchmark):
 
 @pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
 def test_rosenbrock23_pallas_ensemble_N(benchmark, params_batch):
+    solve = make_rb23_solver(_robertson_ode)
     y0_batch = jnp.broadcast_to(jnp.array([1.0, 0.0, 0.0]), (params_batch.shape[0], 3))
     results = benchmark.pedantic(
-        lambda: rb23_ck_pallas_solve_ensemble(
+        lambda: solve(
             y0_batch=y0_batch,
             t_span=(0.0, 1e5),
             params_batch=params_batch,
