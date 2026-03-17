@@ -8,10 +8,9 @@ with 32 trajectories per block.
 Reference: https://github.com/SciML/DiffEqGPU.jl
 """
 # TODOS:
-# 1. Remove Cramer's rule and use a more general jax LU solve
-# 2. Instead of 3 1D blocks, use a single 2D block
-# 3. Add support for non-Robertson problems i.e. general ODEs, using jax.grad or jax.jacfwd for Jacobian and a more general kernel body
-# 4. Rewrite the rodas5_custom_kernel solver to match how the rosenbrock23 solver works i.e. batching 32 trajectories in one warp, masking out trajectories that are done.
+# 1. Instead of 3 1D blocks, use a single 2D block
+# 2. Add support for non-Robertson problems i.e. general ODEs, using jax.grad or jax.jacfwd for Jacobian and a more general kernel body
+# 3. Rewrite the rodas5_custom_kernel solver to match how the rosenbrock23 solver works i.e. batching 32 trajectories in one warp, masking out trajectories that are done.
 
 import functools
 import math
@@ -124,95 +123,6 @@ def _robertson_rb23_step(y0, y1, y2, p0, p1, p2, dt):
     e2 = dto6 * (k12 - 2.0 * k22 + k32)
 
     return u0, u1, u2, e0, e1, e2
-
-
-# ---------------------------------------------------------------------------
-# Public API: single solve (generic)
-# ---------------------------------------------------------------------------
-
-
-def solve(f, y0, t_span, *, rtol=1e-8, atol=1e-10, first_step=None, max_steps=100000):
-    """Solve a stiff autonomous ODE using Rosenbrock23."""
-    y0_arr = jnp.asarray(y0, dtype=jnp.float64)
-    t0, tf = t_span
-    dt0 = jnp.float64(first_step if first_step is not None else (tf - t0) * 1e-6)
-    jac_fn = jax.jacfwd(f)
-
-    def cond_fn(state):
-        t, _, _, n, _ = state
-        return (t < tf) & (n < max_steps)
-
-    def body_fn(state):
-        t, y, dt, n, qold = state
-        dt = jnp.minimum(dt, tf - t)
-
-        J = jac_fn(y)
-        gamma = dt * _d
-        W = jnp.eye(3) - gamma * J
-        lu, piv = jax.scipy.linalg.lu_factor(W)
-        S = lambda v: jax.scipy.linalg.lu_solve((lu, piv), v)
-
-        F0 = f(y)
-        k1 = S(F0)
-
-        F1 = f(y + (dt / 2.0) * k1)
-        k2 = S(F1 - k1) + k1
-
-        u = y + dt * k2
-
-        F2 = f(u)
-        k3 = S(F2 - _e32 * (k2 - F1) - 2.0 * (k1 - F0))
-
-        err_vec = (dt / 6.0) * (k1 - 2.0 * k2 + k3)
-        scale = atol + rtol * jnp.maximum(jnp.abs(y), jnp.abs(u))
-        EEst = jnp.sqrt(jnp.mean((err_vec / scale) ** 2))
-
-        accept = (EEst <= 1.0) & ~jnp.isnan(EEst)
-        t_new = jnp.where(accept, t + dt, t)
-        y_out = jnp.where(accept, u, y)
-
-        # PI controller
-        q11 = jnp.where(EEst == 0.0, 1e-18, EEst) ** _beta1
-        q_accept = jnp.clip(q11 / (qold**_beta2) / _sc_gamma, 1.0 / _qmax, 1.0 / _qmin)
-        q_reject = jnp.minimum(1.0 / _qmin, q11 / _sc_gamma)
-        dtnew = jnp.where(accept, dt / q_accept, dt / q_reject)
-        qold_new = jnp.where(accept, jnp.maximum(EEst, _qoldinit), qold)
-
-        return (t_new, y_out, dtnew, n + 1, qold_new)
-
-    _, final_y, _, _, _ = jax.lax.while_loop(
-        cond_fn,
-        body_fn,
-        (jnp.float64(t0), y0_arr, dt0, jnp.int32(0), jnp.float64(_qoldinit)),
-    )
-    return final_y
-
-
-def solve_ensemble(
-    f,
-    y0,
-    t_span,
-    params_batch,
-    *,
-    rtol=1e-8,
-    atol=1e-10,
-    first_step=None,
-    max_steps=100000,
-):
-    """Solve ensemble using vmap."""
-
-    def _solve_one(params):
-        return solve(
-            lambda y: f(y, params),
-            y0,
-            t_span,
-            rtol=rtol,
-            atol=atol,
-            first_step=first_step,
-            max_steps=max_steps,
-        )
-
-    return jax.jit(jax.vmap(_solve_one))(params_batch)
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,6 @@ from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
 from solvers.rodas5_custom_kernel import solve as rodas5_ck_solve
 from solvers.rodas5_custom_kernel import solve_ensemble as rodas5_ck_solve_ensemble
 from solvers.rodas5_custom_kernel import solve_ensemble_pallas as rodas5_ck_pallas_solve_ensemble
-from solvers.rosenbrock23_custom_kernel import solve as rb23_ck_solve
 from solvers.rosenbrock23_custom_kernel import solve_ensemble_pallas as rb23_ck_pallas_solve_ensemble
 from solvers.scipy_bdf import solve as scipy_bdf_solve
 from solvers.scipy_bdf import solve_ensemble as scipy_bdf_solve_ensemble
@@ -240,17 +239,21 @@ def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
 
 
 def test_rosenbrock23_custom_kernel(benchmark):
-    _solve = jax.jit(
-        lambda: rb23_ck_solve(
-            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-        )
-    )
-    y = benchmark.pedantic(
-        lambda: _solve().block_until_ready(),
+    params_batch = _STANDARD_PARAMS[None, :]  # single-element batch
+    results = benchmark.pedantic(
+        lambda: rb23_ck_pallas_solve_ensemble(
+            y0=[1.0, 0.0, 0.0],
+            t_span=(0.0, 1e5),
+            params_batch=params_batch,
+            first_step=1e-4,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
         warmup_rounds=1,
         rounds=1,
     )
 
+    y = results[0]
     np.testing.assert_allclose(y.sum(), 1.0, atol=1e-6)
     np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-3)
     np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-3)
