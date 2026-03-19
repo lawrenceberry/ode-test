@@ -39,6 +39,9 @@ _qoldinit = 1.0e-4
 # don't fully utilize the available operations/s in the block, but if it's larger than 32, we are batching
 # more ODEs at once, and will end up with more "warp divergence" where some ODE trajectories have finished
 # before others, so operations/s go unused as some ODEs have finished and no longer have any work to do.
+# Note an H100 has 256 KB of shared L1 (per-SM) memory. Depending on the dimensionality of the ODE you are
+# trying to solve, the Triton compiler may have to spill some of the intermediate arrays to global memory
+# if you set the number of ODE trajectories too high, which can cause a slowdown.
 _BLOCK = 32
 
 
