@@ -35,6 +35,34 @@ _C81 = 42.57076742291101;  _C82 = -13.80770672017997;  _C83 = 93.98938432427124;
 
 _BLOCK = 32
 
+_STAGE_SPECS = (
+    (False, ((_a21, 0),), ((_C21, 0),)),
+    (False, ((_a31, 0), (_a32, 1)), ((_C31, 0), (_C32, 1))),
+    (False, ((_a41, 0), (_a42, 1), (_a43, 2)), ((_C41, 0), (_C42, 1), (_C43, 2))),
+    (
+        False,
+        ((_a51, 0), (_a52, 1), (_a53, 2), (_a54, 3)),
+        ((_C51, 0), (_C52, 1), (_C53, 2), (_C54, 3)),
+    ),
+    (
+        False,
+        ((_a61, 0), (_a62, 1), (_a63, 2), (_a64, 3), (_a65, 4)),
+        ((_C61, 0), (_C62, 1), (_C63, 2), (_C64, 3), (_C65, 4)),
+    ),
+    (
+        True,
+        ((1.0, 5),),
+        ((_C71, 0), (_C72, 1), (_C73, 2), (_C74, 3), (_C75, 4), (_C76, 5)),
+    ),
+    (
+        True,
+        ((1.0, 6),),
+        ((_C81, 0), (_C82, 1), (_C83, 2), (_C84, 3), (_C85, 4), (_C86, 5), (_C87, 6)),
+    ),
+)
+
+_FINAL_UPDATE = ((1.0, 7),)
+
 
 def _pad_cols_pow2(n_cols):
     """Return the next power of 2 >= n_cols."""
@@ -44,6 +72,12 @@ def _pad_cols_pow2(n_cols):
 def _make_rodas5_step(jac_fn, n_vars):
     """Create one Rodas5 step specialized for dy/dt = M(t) y."""
     nv = n_vars
+
+    def _m_idx(i, j):
+        return i * nv + j
+
+    def _k_idx(stage, i):
+        return stage * nv + i
 
     def _tuple_select(vals, idx):
         return jax.lax.switch(
@@ -58,7 +92,7 @@ def _make_rodas5_step(jac_fn, n_vars):
 
             def col(j, acc):
                 yj = src_ref.at[:, pl.ds(j, 1)][...][:, 0]
-                mij = m_ref.at[:, pl.ds(i * nv + j, 1)][...][:, 0]
+                mij = m_ref.at[:, pl.ds(_m_idx(i, j), 1)][...][:, 0]
                 return acc + mij * yj
 
             acc = jax.lax.fori_loop(0, nv, col, acc)
@@ -119,7 +153,7 @@ def _make_rodas5_step(jac_fn, n_vars):
 
             def store_m_col(j_s, carry):
                 mij = _tuple_select(row_i, j_s)
-                m_ref.at[:, pl.ds(i_s * nv + j_s, 1)][...] = mij[:, None]
+                m_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = mij[:, None]
                 return carry
 
             return jax.lax.fori_loop(0, nv, store_m_col, carry)
@@ -128,9 +162,9 @@ def _make_rodas5_step(jac_fn, n_vars):
 
         def build_w_row(i_s, carry):
             def build_w_col(j_s, carry):
-                mij = m_ref.at[:, pl.ds(i_s * nv + j_s, 1)][...][:, 0]
+                mij = m_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...][:, 0]
                 val = -mij + jnp.where(i_s == j_s, d, 0.0)
-                w_ref.at[:, pl.ds(i_s * nv + j_s, 1)][...] = val[:, None]
+                w_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = val[:, None]
                 return carry
 
             return jax.lax.fori_loop(0, nv, build_w_col, carry)
@@ -156,212 +190,39 @@ def _make_rodas5_step(jac_fn, n_vars):
 
         jax.lax.fori_loop(0, nv, lu_col, jnp.int32(0))
 
+        def _assemble_stage_state(base_ref, coeffs):
+            def write_u(i, carry):
+                ui = base_ref.at[:, pl.ds(i, 1)][...][:, 0]
+                for coeff, stage in coeffs:
+                    ki = k_ref.at[:, pl.ds(_k_idx(stage, i), 1)][...][:, 0]
+                    ui = ui + coeff * ki
+                u_ref.at[:, pl.ds(i, 1)][...] = ui[:, None]
+                return carry
+
+            jax.lax.fori_loop(0, nv, write_u, jnp.int32(0))
+
+        def _assemble_stage_rhs(coeffs):
+            def write_x(i, carry):
+                xi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
+                for coeff, stage in coeffs:
+                    ki = k_ref.at[:, pl.ds(_k_idx(stage, i), 1)][...][:, 0]
+                    xi = xi + coeff * ki * inv_dt
+                x_ref.at[:, pl.ds(i, 1)][...] = xi[:, None]
+                return carry
+
+            jax.lax.fori_loop(0, nv, write_x, jnp.int32(0))
+
         _eval_F(m_ref, y_ref, x_ref)
         _lu_solve(w_ref, x_ref, k_ref, 0)
 
-        def s2_u(i, carry):
-            yi = y_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (yi + _a21 * k1i)[:, None]
-            return carry
+        for stage, (use_u_base, state_coeffs, rhs_coeffs) in enumerate(_STAGE_SPECS, start=1):
+            base_ref = u_ref if use_u_base else y_ref
+            _assemble_stage_state(base_ref, state_coeffs)
+            _eval_F(m_ref, u_ref, x_ref)
+            _assemble_stage_rhs(rhs_coeffs)
+            _lu_solve(w_ref, x_ref, k_ref, stage)
 
-        jax.lax.fori_loop(0, nv, s2_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s2_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (fi + _C21 * k1i * inv_dt)[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s2_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 1)
-
-        def s3_u(i, carry):
-            yi = y_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (yi + _a31 * k1i + _a32 * k2i)[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s3_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s3_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (fi + (_C31 * k1i + _C32 * k2i) * inv_dt)[
-                :, None
-            ]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s3_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 2)
-
-        def s4_u(i, carry):
-            yi = y_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (yi + _a41 * k1i + _a42 * k2i + _a43 * k3i)[
-                :, None
-            ]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s4_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s4_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (
-                fi + (_C41 * k1i + _C42 * k2i + _C43 * k3i) * inv_dt
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s4_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 3)
-
-        def s5_u(i, carry):
-            yi = y_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (
-                yi + _a51 * k1i + _a52 * k2i + _a53 * k3i + _a54 * k4i
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s5_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s5_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (
-                fi + (_C51 * k1i + _C52 * k2i + _C53 * k3i + _C54 * k4i) * inv_dt
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s5_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 4)
-
-        def s6_u(i, carry):
-            yi = y_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            k5i = k_ref.at[:, pl.ds(4 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (
-                yi + _a61 * k1i + _a62 * k2i + _a63 * k3i + _a64 * k4i + _a65 * k5i
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s6_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s6_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            k5i = k_ref.at[:, pl.ds(4 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (
-                fi
-                + (_C61 * k1i + _C62 * k2i + _C63 * k3i + _C64 * k4i + _C65 * k5i)
-                * inv_dt
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s6_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 5)
-
-        def s7_u(i, carry):
-            ui = u_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k6i = k_ref.at[:, pl.ds(5 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (ui + k6i)[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s7_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s7_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            k5i = k_ref.at[:, pl.ds(4 * nv + i, 1)][...][:, 0]
-            k6i = k_ref.at[:, pl.ds(5 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (
-                fi
-                + (
-                    _C71 * k1i
-                    + _C72 * k2i
-                    + _C73 * k3i
-                    + _C74 * k4i
-                    + _C75 * k5i
-                    + _C76 * k6i
-                )
-                * inv_dt
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s7_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 6)
-
-        def s8_u(i, carry):
-            ui = u_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k7i = k_ref.at[:, pl.ds(6 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (ui + k7i)[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s8_u, jnp.int32(0))
-        _eval_F(m_ref, u_ref, x_ref)
-
-        def s8_rhs(i, carry):
-            fi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k1i = k_ref.at[:, pl.ds(0 * nv + i, 1)][...][:, 0]
-            k2i = k_ref.at[:, pl.ds(1 * nv + i, 1)][...][:, 0]
-            k3i = k_ref.at[:, pl.ds(2 * nv + i, 1)][...][:, 0]
-            k4i = k_ref.at[:, pl.ds(3 * nv + i, 1)][...][:, 0]
-            k5i = k_ref.at[:, pl.ds(4 * nv + i, 1)][...][:, 0]
-            k6i = k_ref.at[:, pl.ds(5 * nv + i, 1)][...][:, 0]
-            k7i = k_ref.at[:, pl.ds(6 * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (
-                fi
-                + (
-                    _C81 * k1i
-                    + _C82 * k2i
-                    + _C83 * k3i
-                    + _C84 * k4i
-                    + _C85 * k5i
-                    + _C86 * k6i
-                    + _C87 * k7i
-                )
-                * inv_dt
-            )[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, s8_rhs, jnp.int32(0))
-        _lu_solve(w_ref, x_ref, k_ref, 7)
-
-        def ynew(i, carry):
-            ui = u_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k8i = k_ref.at[:, pl.ds(7 * nv + i, 1)][...][:, 0]
-            u_ref.at[:, pl.ds(i, 1)][...] = (ui + k8i)[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, ynew, jnp.int32(0))
+        _assemble_stage_state(u_ref, _FINAL_UPDATE)
 
     return step
 
