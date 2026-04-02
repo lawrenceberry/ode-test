@@ -22,6 +22,7 @@ _V6_SAVE_TIMES = jnp.array(_T_SPAN, dtype=jnp.float64)
 _V6_MULTI_SAVE_TIMES = jnp.array((0.0, 0.125, 0.25, 0.5, 1.0), dtype=jnp.float64)
 _SYSTEM_DIMS = [30, 50, 70]
 _ENSEMBLE_SIZES = [2, 100, 1000, 10000, 100_000]
+_V6_LINEAR_SOLVERS = ("fp64", "fp32")
 
 
 def _time_linear_scale(t):
@@ -122,6 +123,10 @@ def _make_nn_reaction_system(n_vars):
 
 def _dim_id(n_vars):
     return f"{n_vars}d"
+
+
+def _linear_solver_id(linear_solver):
+    return linear_solver
 
 
 def _make_params_batch(size, seed):
@@ -582,14 +587,17 @@ def test_rodas5_v5_pallas_compile_time(benchmark, nn_reaction_system):
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
-def test_rodas5_v6_matches_closed_form_time_dependent_reference(nn_reaction_system):
+@pytest.mark.parametrize("linear_solver", _V6_LINEAR_SOLVERS, ids=_linear_solver_id)
+def test_rodas5_v6_matches_closed_form_time_dependent_reference(
+    nn_reaction_system, linear_solver
+):
     """Validate v6 solver on a time-dependent nearest-neighbor reaction system."""
     N = 256
     system = nn_reaction_system
 
     y0_batch = _broadcast_y0(system["y0"], N)
 
-    solve_v6 = make_rodas5_v6_solver(system["time_jac"])
+    solve_v6 = make_rodas5_v6_solver(system["time_jac"], linear_solver=linear_solver)
     y_v6 = solve_v6(
         y0_batch=y0_batch,
         t_span=_V6_SAVE_TIMES,
@@ -611,13 +619,14 @@ def test_rodas5_v6_matches_closed_form_time_dependent_reference(nn_reaction_syst
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
-def test_rodas5_v6_saves_multiple_times(nn_reaction_system):
+@pytest.mark.parametrize("linear_solver", _V6_LINEAR_SOLVERS, ids=_linear_solver_id)
+def test_rodas5_v6_saves_multiple_times(nn_reaction_system, linear_solver):
     """Validate v6 solver on several requested save times."""
     N = 64
     system = nn_reaction_system
 
     y0_batch = _broadcast_y0(system["y0"], N)
-    solve_v6 = make_rodas5_v6_solver(system["time_jac"])
+    solve_v6 = make_rodas5_v6_solver(system["time_jac"], linear_solver=linear_solver)
 
     y_v6 = solve_v6(
         y0_batch=y0_batch,
@@ -641,10 +650,13 @@ def test_rodas5_v6_saves_multiple_times(nn_reaction_system):
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_rodas5_v6_pallas_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
+@pytest.mark.parametrize("linear_solver", _V6_LINEAR_SOLVERS, ids=_linear_solver_id)
+def test_rodas5_v6_pallas_ensemble_N(
+    benchmark, nn_reaction_system, ensemble_size, linear_solver
+):
     """Rodas5 v6 Pallas ensemble benchmark on the time-dependent system."""
     system = nn_reaction_system
-    solve_v6 = make_rodas5_v6_solver(system["time_jac"])
+    solve_v6 = make_rodas5_v6_solver(system["time_jac"], linear_solver=linear_solver)
     y0_batch = _broadcast_y0(system["y0"], ensemble_size)
     results = benchmark.pedantic(
         lambda: solve_v6(
@@ -663,12 +675,13 @@ def test_rodas5_v6_pallas_ensemble_N(benchmark, nn_reaction_system, ensemble_siz
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
-def test_rodas5_v6_pallas_compile_time(benchmark, nn_reaction_system):
+@pytest.mark.parametrize("linear_solver", _V6_LINEAR_SOLVERS, ids=_linear_solver_id)
+def test_rodas5_v6_pallas_compile_time(benchmark, nn_reaction_system, linear_solver):
     """Measure approximate compile time for v6 (time-dependent Jacobian)."""
     N = 1234
     system = nn_reaction_system
 
-    solve_v6 = make_rodas5_v6_solver(system["time_jac"])
+    solve_v6 = make_rodas5_v6_solver(system["time_jac"], linear_solver=linear_solver)
     y0_batch = _broadcast_y0(system["y0"], N)
 
     kwargs = dict(
@@ -726,3 +739,31 @@ def test_rodas5_v6_rejects_invalid_save_times(t_span, match):
             rtol=1e-6,
             atol=1e-8,
         )
+
+
+@pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
+def test_rodas5_v6_fp32_matches_fp64_baseline(nn_reaction_system):
+    """Validate the FP32 LU v6 path against the FP64 baseline."""
+    N = 256
+    system = nn_reaction_system
+    y0_batch = _broadcast_y0(system["y0"], N)
+
+    solve_fp64 = make_rodas5_v6_solver(system["time_jac"], linear_solver="fp64")
+    solve_fp32 = make_rodas5_v6_solver(system["time_jac"], linear_solver="fp32")
+
+    y_fp64 = solve_fp64(
+        y0_batch=y0_batch,
+        t_span=_V6_SAVE_TIMES,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+    y_fp32 = solve_fp32(
+        y0_batch=y0_batch,
+        t_span=_V6_SAVE_TIMES,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+
+    np.testing.assert_allclose(np.asarray(y_fp32), np.asarray(y_fp64), rtol=2e-4, atol=3e-8)

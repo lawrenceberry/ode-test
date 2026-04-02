@@ -63,6 +63,7 @@ _STAGE_SPECS = (
 )
 
 _FINAL_UPDATE = ((1.0, 7),)
+_SUPPORTED_LINEAR_SOLVERS = ("fp64", "fp32")
 
 
 def _pad_cols_pow2(n_cols):
@@ -70,9 +71,10 @@ def _pad_cols_pow2(n_cols):
     return 1 << (n_cols - 1).bit_length()
 
 
-def _make_rodas5_step(jac_fn, n_vars):
+def _make_rodas5_step(jac_fn, n_vars, linear_solver):
     """Create one Rodas5 step specialized for dy/dt = M(t) y."""
     nv = n_vars
+    use_fp32 = linear_solver == "fp32"
 
     def _m_idx(i, j):
         return i * nv + j
@@ -102,13 +104,39 @@ def _make_rodas5_step(jac_fn, n_vars):
 
         jax.lax.fori_loop(0, nv, row, jnp.int32(0))
 
-    def _lu_solve(w_ref, x_ref, k_ref, stage):
+    def _copy_vec_to_stage(src_ref, k_ref, stage):
+        off = stage * nv
+
+        def copy_row(i, carry):
+            val = src_ref.at[:, pl.ds(i, 1)][...][:, 0]
+            k_ref.at[:, pl.ds(off + i, 1)][...] = val[:, None]
+            return carry
+
+        jax.lax.fori_loop(0, nv, copy_row, jnp.int32(0))
+
+    def _copy_vec_to_low(src_ref, dst_ref):
+        def copy_row(i, carry):
+            xi = src_ref.at[:, pl.ds(i, 1)][...][:, 0]
+            dst_ref.at[:, pl.ds(i, 1)][...] = xi.astype(jnp.float32)[:, None]
+            return carry
+
+        jax.lax.fori_loop(0, nv, copy_row, jnp.int32(0))
+
+    def _copy_low_to_vec(src_ref, dst_ref):
+        def copy_row(i, carry):
+            xi = src_ref.at[:, pl.ds(i, 1)][...][:, 0]
+            dst_ref.at[:, pl.ds(i, 1)][...] = xi.astype(jnp.float64)[:, None]
+            return carry
+
+        jax.lax.fori_loop(0, nv, copy_row, jnp.int32(0))
+
+    def _lu_solve_into_ref(w_ref, vec_ref):
         def fwd_row(i, carry):
             def fwd_col(j, carry):
-                xi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-                xj = x_ref.at[:, pl.ds(j, 1)][...][:, 0]
+                xi = vec_ref.at[:, pl.ds(i, 1)][...][:, 0]
+                xj = vec_ref.at[:, pl.ds(j, 1)][...][:, 0]
                 lij = w_ref.at[:, pl.ds(i * nv + j, 1)][...][:, 0]
-                x_ref.at[:, pl.ds(i, 1)][...] = (xi - lij * xj)[:, None]
+                vec_ref.at[:, pl.ds(i, 1)][...] = (xi - lij * xj)[:, None]
                 return carry
 
             return jax.lax.fori_loop(0, i, fwd_col, carry)
@@ -120,52 +148,28 @@ def _make_rodas5_step(jac_fn, n_vars):
 
             def bwd_col(j_off, carry):
                 j = i + 1 + j_off
-                xi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-                xj = x_ref.at[:, pl.ds(j, 1)][...][:, 0]
+                xi = vec_ref.at[:, pl.ds(i, 1)][...][:, 0]
+                xj = vec_ref.at[:, pl.ds(j, 1)][...][:, 0]
                 uij = w_ref.at[:, pl.ds(i * nv + j, 1)][...][:, 0]
-                x_ref.at[:, pl.ds(i, 1)][...] = (xi - uij * xj)[:, None]
+                vec_ref.at[:, pl.ds(i, 1)][...] = (xi - uij * xj)[:, None]
                 return carry
 
             jax.lax.fori_loop(0, nv - 1 - i, bwd_col, carry)
-            xi = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
+            xi = vec_ref.at[:, pl.ds(i, 1)][...][:, 0]
             uii = w_ref.at[:, pl.ds(i * nv + i, 1)][...][:, 0]
-            x_ref.at[:, pl.ds(i, 1)][...] = (xi / uii)[:, None]
+            vec_ref.at[:, pl.ds(i, 1)][...] = (xi / uii)[:, None]
             return carry
 
         jax.lax.fori_loop(0, nv, bwd_row, jnp.int32(0))
 
-        off = stage * nv
-
-        def copy_k(i, carry):
-            val = x_ref.at[:, pl.ds(i, 1)][...][:, 0]
-            k_ref.at[:, pl.ds(off + i, 1)][...] = val[:, None]
-            return carry
-
-        jax.lax.fori_loop(0, nv, copy_k, jnp.int32(0))
-
-    def step(t, dt, m_ref, w_ref, x_ref, y_ref, k_ref, u_ref):
-        dtgamma = dt * _gamma
-        inv_dt = 1.0 / dt
-        d = 1.0 / dtgamma
-        m = jac_fn(t)
-
-        def store_m_row(i_s, carry):
-            row_i = _tuple_select(m, i_s)
-
-            def store_m_col(j_s, carry):
-                mij = _tuple_select(row_i, j_s)
-                m_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = mij[:, None]
-                return carry
-
-            return jax.lax.fori_loop(0, nv, store_m_col, carry)
-
-        jax.lax.fori_loop(0, nv, store_m_row, jnp.int32(0))
-
+    def _factor_w(m_ref, w_ref, d):
         def build_w_row(i_s, carry):
             def build_w_col(j_s, carry):
                 mij = m_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...][:, 0]
                 val = -mij + jnp.where(i_s == j_s, d, 0.0)
-                w_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = val[:, None]
+                w_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = val.astype(w_ref.dtype)[
+                    :, None
+                ]
                 return carry
 
             return jax.lax.fori_loop(0, nv, build_w_col, carry)
@@ -191,6 +195,39 @@ def _make_rodas5_step(jac_fn, n_vars):
 
         jax.lax.fori_loop(0, nv, lu_col, jnp.int32(0))
 
+    def _solve_linear_system(m_ref, w_ref, x_ref, x_low_ref, k_ref, u_ref, d, stage):
+        del m_ref, u_ref, d
+        if not use_fp32:
+            _lu_solve_into_ref(w_ref, x_ref)
+            _copy_vec_to_stage(x_ref, k_ref, stage)
+            return
+
+        _copy_vec_to_low(x_ref, x_low_ref)
+        _lu_solve_into_ref(w_ref, x_low_ref)
+        _copy_low_to_vec(x_low_ref, x_ref)
+        _copy_vec_to_stage(x_ref, k_ref, stage)
+
+    def step(t, dt, m_ref, w_ref, x_ref, x_low_ref, y_ref, k_ref, u_ref):
+        dtgamma = dt * _gamma
+        inv_dt = 1.0 / dt
+        d = 1.0 / dtgamma
+        m = jac_fn(t)
+
+        def store_m_row(i_s, carry):
+            row_i = _tuple_select(m, i_s)
+
+            def store_m_col(j_s, carry):
+                mij = _tuple_select(row_i, j_s)
+                m_ref.at[:, pl.ds(_m_idx(i_s, j_s), 1)][...] = mij.astype(
+                    m_ref.dtype
+                )[:, None]
+                return carry
+
+            return jax.lax.fori_loop(0, nv, store_m_col, carry)
+
+        jax.lax.fori_loop(0, nv, store_m_row, jnp.int32(0))
+        _factor_w(m_ref, w_ref, d)
+
         def _assemble_stage_state(base_ref, coeffs):
             def write_u(i, carry):
                 ui = base_ref.at[:, pl.ds(i, 1)][...][:, 0]
@@ -214,26 +251,33 @@ def _make_rodas5_step(jac_fn, n_vars):
             jax.lax.fori_loop(0, nv, write_x, jnp.int32(0))
 
         _eval_F(m_ref, y_ref, x_ref)
-        _lu_solve(w_ref, x_ref, k_ref, 0)
+        _solve_linear_system(m_ref, w_ref, x_ref, x_low_ref, k_ref, u_ref, d, 0)
 
-        for stage, (use_u_base, state_coeffs, rhs_coeffs) in enumerate(_STAGE_SPECS, start=1):
+        for stage, (use_u_base, state_coeffs, rhs_coeffs) in enumerate(
+            _STAGE_SPECS, start=1
+        ):
             base_ref = u_ref if use_u_base else y_ref
             _assemble_stage_state(base_ref, state_coeffs)
             _eval_F(m_ref, u_ref, x_ref)
             _assemble_stage_rhs(rhs_coeffs)
-            _lu_solve(w_ref, x_ref, k_ref, stage)
+            _solve_linear_system(m_ref, w_ref, x_ref, x_low_ref, k_ref, u_ref, d, stage)
 
         _assemble_stage_state(u_ref, _FINAL_UPDATE)
 
     return step
 
 
-def make_solver(jac_fn):
+def make_solver(jac_fn, *, linear_solver="fp64"):
     """Create a Pallas ensemble Rodas5 solver for dy/dt = M(t) y.
 
     Args:
         jac_fn: ``t -> M(t)`` returning a square dense Jacobian/state matrix.
+        linear_solver: ``"fp64"`` or ``"fp32"`` for the LU solve precision.
     """
+    if linear_solver not in _SUPPORTED_LINEAR_SOLVERS:
+        raise ValueError(
+            f"linear_solver must be one of {_SUPPORTED_LINEAR_SOLVERS}, got {linear_solver!r}"
+        )
     M0 = jnp.asarray(jac_fn(jnp.float64(0.0)), dtype=jnp.float64)
     if M0.ndim != 2 or M0.shape[0] != M0.shape[1]:
         raise ValueError(
@@ -276,10 +320,23 @@ def make_solver(jac_fn):
         a_tol,
         ms,
     ):
-        step_fn = _make_rodas5_step(jac_fn, n_vars)
+        step_fn = _make_rodas5_step(jac_fn, n_vars, linear_solver)
         hist_cols = n_save * y_cols
+        w_dtype = jnp.float32 if linear_solver == "fp32" else jnp.float64
+        m_dtype = jnp.float32 if linear_solver == "fp32" else jnp.float64
 
-        def kernel_body(times_ref, y0_ref, hist_ref, y_ref, w_ref, x_ref, k_ref, u_ref, m_ref):
+        def kernel_body(
+            times_ref,
+            y0_ref,
+            hist_ref,
+            y_ref,
+            w_ref,
+            x_ref,
+            x_low_ref,
+            k_ref,
+            u_ref,
+            m_ref,
+        ):
             for i in range(n_vars):
                 y_ref.at[:, i][...] = y0_ref.at[:, i][...]
 
@@ -330,6 +387,7 @@ def make_solver(jac_fn):
                     m_ref,
                     w_ref,
                     x_ref,
+                    x_low_ref,
                     y_ref,
                     k_ref,
                     u_ref,
@@ -395,6 +453,7 @@ def make_solver(jac_fn):
         y_bs = pl.BlockSpec((_BLOCK, y_cols), lambda i: (i, 0))
         w_bs = pl.BlockSpec((_BLOCK, w_cols), lambda i: (i, 0))
         x_bs = pl.BlockSpec((_BLOCK, x_cols), lambda i: (i, 0))
+        x_low_bs = pl.BlockSpec((_BLOCK, x_cols), lambda i: (i, 0))
         k_bs = pl.BlockSpec((_BLOCK, k_cols), lambda i: (i, 0))
         m_cols = _pad_cols_pow2(n_vars * n_vars)
         m_bs = pl.BlockSpec((_BLOCK, m_cols), lambda i: (i, 0))
@@ -403,23 +462,25 @@ def make_solver(jac_fn):
             out_shape=[
                 jax.ShapeDtypeStruct((n_pad, hist_cols), jnp.float64),
                 jax.ShapeDtypeStruct((n_pad, y_cols), jnp.float64),
-                jax.ShapeDtypeStruct((n_pad, w_cols), jnp.float64),
+                jax.ShapeDtypeStruct((n_pad, w_cols), w_dtype),
                 jax.ShapeDtypeStruct((n_pad, x_cols), jnp.float64),
+                jax.ShapeDtypeStruct((n_pad, x_cols), jnp.float32),
                 jax.ShapeDtypeStruct((n_pad, k_cols), jnp.float64),
                 jax.ShapeDtypeStruct((n_pad, x_cols), jnp.float64),
-                jax.ShapeDtypeStruct((n_pad, m_cols), jnp.float64),
+                jax.ShapeDtypeStruct((n_pad, m_cols), m_dtype),
             ],
             grid=(n_pad // _BLOCK,),
             in_specs=(times_bs, y_bs),
-            # Output refs match kernel_body(times_ref, y0_ref, hist_ref, y_ref, w_ref, x_ref, k_ref, u_ref, m_ref):
+            # Output refs match kernel_body(times_ref, y0_ref, hist_ref, y_ref, w_ref, x_ref, x_low_ref, k_ref, u_ref, m_ref):
             # hist_bs -> saved states over the requested time array
             # y_bs -> accepted state y
-            # w_bs -> LU workspace for W = I/(dt*gamma) - M(t)
-            # x_bs -> stage RHS / solve workspace x
+            # w_bs -> LU workspace for W = I/(dt*gamma) - M(t), dtype depends on linear_solver
+            # x_bs -> stage RHS / solve workspace x (float64)
+            # x_low_bs -> low-precision solve / correction workspace (float32)
             # k_bs -> stacked Rodas5 stage increments k1..k8
-            # x_bs -> temporary stage state u
+            # x_bs -> temporary stage state u (float64)
             # m_bs -> per-trajectory flattened Jacobian M(t)
-            out_specs=(hist_bs, y_bs, w_bs, x_bs, k_bs, x_bs, m_bs),
+            out_specs=(hist_bs, y_bs, w_bs, x_bs, x_low_bs, k_bs, x_bs, m_bs),
             compiler_params=pltriton.CompilerParams(num_warps=1, num_stages=2),
         )(times_arr, y0_arr)
         return jnp.reshape(results[0], (n_pad, n_save, y_cols))
