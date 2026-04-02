@@ -18,7 +18,7 @@ from solvers.rodas5_custom_kernel_v5 import make_solver as make_rodas5_v5_solver
 from solvers.rodas5_custom_kernel_v6 import make_solver as make_rodas5_v6_solver
 
 _T_SPAN = (0.0, 1.0)
-_SYSTEM_DIMS = [30, 50]
+_SYSTEM_DIMS = [30, 50, 70]
 _ENSEMBLE_SIZES = [2, 100, 1000, 10000, 100_000]
 
 
