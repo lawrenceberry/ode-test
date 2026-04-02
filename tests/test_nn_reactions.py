@@ -16,6 +16,7 @@ from solvers.rodas5_custom_kernel_v3 import make_solver as make_rodas5_v3_solver
 from solvers.rodas5_custom_kernel_v4 import make_solver as make_rodas5_v4_solver
 from solvers.rodas5_custom_kernel_v5 import make_solver as make_rodas5_v5_solver
 from solvers.rodas5_custom_kernel_v6 import make_solver as make_rodas5_v6_solver
+from solvers.rodas5_custom_kernel_v7_tc import make_solver as make_rodas5_v7_tc_solver
 
 _T_SPAN = (0.0, 1.0)
 _V6_SAVE_TIMES = jnp.array(_T_SPAN, dtype=jnp.float64)
@@ -767,3 +768,96 @@ def test_rodas5_v6_fp32_matches_fp64_baseline(nn_reaction_system):
     ).block_until_ready()
 
     np.testing.assert_allclose(np.asarray(y_fp32), np.asarray(y_fp64), rtol=2e-4, atol=3e-8)
+
+
+@pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
+def test_rodas5_v7_tc_matches_closed_form_time_dependent_reference(nn_reaction_system):
+    """Validate the experimental blocked-LU Tensor Core-style solver on 50D."""
+    N = 128
+    system = nn_reaction_system
+    y0_batch = _broadcast_y0(system["y0"], N)
+
+    solve_v7 = make_rodas5_v7_tc_solver(system["time_jac"])
+    y_v7 = solve_v7(
+        y0_batch=y0_batch,
+        t_span=_V6_SAVE_TIMES,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+    y_v7_np = np.asarray(y_v7)
+
+    y_exact_traj = _time_exact_trajectory(system, _V6_SAVE_TIMES)
+    y_exact_batch = np.broadcast_to(
+        y_exact_traj, (N, y_exact_traj.shape[0], y_exact_traj.shape[1])
+    )
+
+    assert y_v7.shape == (N, len(_V6_SAVE_TIMES), system["n_vars"])
+    np.testing.assert_allclose(y_v7_np[:, 0, :], np.asarray(y0_batch), atol=0.0)
+    np.testing.assert_allclose(y_v7_np.sum(axis=2), 1.0, atol=3e-5)
+    np.testing.assert_allclose(y_v7_np, y_exact_batch, rtol=8e-4, atol=6e-8)
+
+
+@pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+def test_rodas5_v7_tc_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
+    """Benchmark the experimental blocked-LU Tensor Core-style solver on 50D."""
+    system = nn_reaction_system
+    solve_v7 = make_rodas5_v7_tc_solver(system["time_jac"])
+    y0_batch = _broadcast_y0(system["y0"], ensemble_size)
+    results = benchmark.pedantic(
+        lambda: solve_v7(
+            y0_batch=y0_batch,
+            t_span=_V6_SAVE_TIMES,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+
+    assert results.shape == (ensemble_size, len(_V6_SAVE_TIMES), system["n_vars"])
+    np.testing.assert_allclose(np.asarray(results).sum(axis=2), 1.0, atol=3e-5)
+
+
+@pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
+def test_rodas5_v7_tc_compile_time(benchmark, nn_reaction_system):
+    """Measure approximate compile time for the experimental blocked-LU solver."""
+    N = 1234
+    system = nn_reaction_system
+
+    solve_v7 = make_rodas5_v7_tc_solver(system["time_jac"])
+    y0_batch = _broadcast_y0(system["y0"], N)
+
+    kwargs = dict(
+        y0_batch=y0_batch,
+        t_span=_V6_SAVE_TIMES,
+        first_step=7e-7,
+        rtol=1.23e-6,
+        atol=4.56e-8,
+        max_steps=654321,
+    )
+
+    def measure_compile_estimate():
+        t0 = time.perf_counter()
+        y_first = solve_v7(**kwargs).block_until_ready()
+        first_call_s = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        y_second = solve_v7(**kwargs).block_until_ready()
+        second_call_s = time.perf_counter() - t1
+
+        assert y_first.shape == (N, len(_V6_SAVE_TIMES), system["n_vars"])
+        assert y_second.shape == (N, len(_V6_SAVE_TIMES), system["n_vars"])
+        np.testing.assert_allclose(np.asarray(y_first).sum(axis=2), 1.0, atol=3e-5)
+        return max(first_call_s - second_call_s, 0.0)
+
+    compile_estimate_s = benchmark.pedantic(
+        measure_compile_estimate,
+        warmup_rounds=0,
+        rounds=1,
+        iterations=1,
+    )
+    benchmark.extra_info["compile_estimate_s"] = float(compile_estimate_s)
+    assert compile_estimate_s >= 0.0
