@@ -12,6 +12,10 @@ For linear systems dy/dt = J(p) y, pass jac_fn instead of f to avoid
 automatic differentiation entirely.
 """
 
+import functools
+
+import numpy as np
+
 import jax
 
 jax.config.update("jax_enable_x64", True)  # noqa: E402 - must precede jax.numpy import
@@ -104,11 +108,15 @@ def make_solver(
         _f_batched = jax.vmap(f)
         _jac_batched = jax.vmap(lambda y, p: jax.jacobian(lambda y_: f(y_, p))(y))
 
-    @jax.jit
-    def _solve_groups(y0_arr, params_groups, t0, tf, dt0, rtol, atol, max_steps):
+    @functools.partial(
+        jax.jit,
+        static_argnames=("n_save", "max_steps"),
+    )
+    def _solve_impl(y0_arr, params_groups, times, *, n_save, max_steps, dt0, rtol, atol):
         n_vars = y0_arr.shape[0]
         bs = params_groups.shape[1]
         eye_lu = jnp.eye(n_vars, dtype=lu_dtype)[None, :, :]
+        tf = times[-1]
 
         def _factorize_from_jacobian(jac_lu, dt):
             dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
@@ -185,6 +193,12 @@ def make_solver(
             return u + k8, k8
 
         def _solve_chunk(params_chunk):
+            y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
+            hist_init = jnp.zeros((bs, n_save, n_vars), dtype=jnp.float64).at[:, 0, :].set(y_init)
+            t_init = jnp.full((bs,), times[0], dtype=jnp.float64)
+            dt_init = jnp.full((bs,), dt0, dtype=jnp.float64)
+            save_idx_init = jnp.ones((bs,), dtype=jnp.int32)
+
             if jac_fn is not None:
                 jac = _jac_fn_batched(params_chunk)
                 jac_matvec = jac.astype(matvec_dtype)
@@ -213,13 +227,19 @@ def make_solver(
                     return _step_with_factored_system(y, dt, f_eval, jac_lu)
 
             def cond_fn(state):
-                t, _, _, n_steps = state
-                return jnp.any(t < tf) & (n_steps < max_steps)
+                t, _, _, _, save_idx, n_steps = state
+                active = save_idx < n_save
+                return (jnp.min(jnp.where(active, t, tf)) < tf) & (n_steps < max_steps)
 
             def body_fn(state):
-                t, y, dt, n_steps = state
-                active = t < tf
-                dt_use = jnp.where(active, jnp.minimum(dt, tf - t), 1e-30)
+                t, y, dt, hist, save_idx, n_steps = state
+                active = save_idx < n_save
+                next_target = times[save_idx]
+                dt_use = jnp.where(
+                    active,
+                    jnp.maximum(jnp.minimum(dt, next_target - t), 1e-30),
+                    1e-30,
+                )
 
                 y_new, err_est = _step_batch(y, dt_use)
 
@@ -230,6 +250,14 @@ def make_solver(
                 t_new = jnp.where(accept, t + dt_use, t)
                 y_out = jnp.where(accept[:, None], y_new, y)
 
+                reached = accept & (
+                    jnp.abs(t_new - next_target)
+                    <= 1e-12 * jnp.maximum(1.0, jnp.abs(next_target))
+                )
+                slot_mask = jax.nn.one_hot(save_idx, n_save, dtype=jnp.bool_) & reached[:, None]
+                hist_new = jnp.where(slot_mask[:, :, None], y_out[:, None, :], hist)
+                save_idx_new = save_idx + reached.astype(jnp.int32)
+
                 safe_err = jnp.where(
                     jnp.isnan(err_norm) | (err_norm > 1e18),
                     1e18,
@@ -238,15 +266,11 @@ def make_solver(
                 factor = jnp.clip(0.9 * safe_err ** (-1.0 / 6.0), 0.2, 6.0)
                 dt_new = jnp.where(active, dt_use * factor, dt)
 
-                return (t_new, y_out, dt_new, n_steps + 1)
+                return (t_new, y_out, dt_new, hist_new, save_idx_new, n_steps + 1)
 
-            y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
-            t_init = jnp.full((bs,), t0, dtype=jnp.float64)
-            dt_init = jnp.full((bs,), dt0, dtype=jnp.float64)
-
-            init = (t_init, y_init, dt_init, jnp.int32(0))
-            _, final_y, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
-            return final_y
+            init = (t_init, y_init, dt_init, hist_init, save_idx_init, jnp.int32(0))
+            _, _, _, hist_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
+            return hist_final
 
         return jax.vmap(_solve_chunk)(params_groups)
 
@@ -264,8 +288,16 @@ def make_solver(
         params_batch_arr = jnp.asarray(params_batch)
         n_vars = int(y0_arr.shape[0])
         N = int(params_batch_arr.shape[0])
-        t0, tf = t_span
-        dt0 = jnp.float64(first_step if first_step is not None else (tf - t0) * 1e-6)
+        times = np.asarray(t_span, dtype=np.float64)
+        if times.ndim != 1:
+            raise ValueError(f"t_span must be a 1D array of save times, got shape {times.shape}")
+        if times.size < 2:
+            raise ValueError(f"t_span must contain at least 2 save times, got {times.size}")
+        if not np.all(np.diff(times) > 0.0):
+            raise ValueError("t_span must be strictly increasing")
+
+        times_jnp = jnp.asarray(times, dtype=jnp.float64)
+        dt0 = jnp.float64(first_step if first_step is not None else (times[-1] - times[0]) * 1e-6)
         bs = N if batch_size is None else batch_size
 
         n_chunks = (N + bs - 1) // bs
@@ -283,17 +315,17 @@ def make_solver(
         params_groups = params_padded.reshape(
             (n_chunks, bs) + params_batch_arr.shape[1:]
         )
-        results = _solve_groups(
+        results = _solve_impl(
             y0_arr,
             params_groups,
-            jnp.float64(t0),
-            jnp.float64(tf),
-            dt0,
-            jnp.float64(rtol),
-            jnp.float64(atol),
-            jnp.int32(max_steps),
+            times_jnp,
+            n_save=int(times.size),
+            max_steps=int(max_steps),
+            dt0=float(dt0),
+            rtol=float(rtol),
+            atol=float(atol),
         )
-        return results.reshape(n_padded, n_vars)[:N]
+        return results.reshape(n_padded, int(times.size), n_vars)[:N]
 
     return _solve
 

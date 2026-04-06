@@ -165,6 +165,26 @@ def _time_exact_trajectory(system, save_times):
     )
 
 
+def _reference_trajectory(system, params_batch, save_times):
+    save_times_np = np.asarray(save_times, dtype=np.float64)
+    traj = []
+    for i, tf in enumerate(save_times_np):
+        if i == 0:
+            traj.append(np.broadcast_to(np.asarray(system["y0"]), (params_batch.shape[0], system["n_vars"])))
+            continue
+        y_ref = rodas5_solve_ensemble(
+            system["array"],
+            y0=system["y0"],
+            t_span=(float(save_times_np[0]), float(tf)),
+            params_batch=params_batch,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready()
+        traj.append(np.asarray(y_ref))
+    return np.stack(traj, axis=1)
+
+
 @pytest.fixture
 def nn_reaction_system(request):
     """Configurable nearest-neighbor reaction system parameterized by dimension."""
@@ -910,9 +930,10 @@ def test_rodas5_v2_matches_reference(nn_reaction_system, batch_size):
         atol=1e-8,
     ).block_until_ready()
 
-    assert y_v2.shape == (N, system["n_vars"])
-    np.testing.assert_allclose(y_v2.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v2, y_ref, rtol=1e-6, atol=1e-9)
+    assert y_v2.shape == (N, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(y_v2[:, 0, :], np.asarray(_broadcast_y0(system["y0"], N)), atol=0.0)
+    np.testing.assert_allclose(y_v2.sum(axis=2), 1.0, atol=3e-6)
+    np.testing.assert_allclose(y_v2[:, -1, :], y_ref, rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -935,8 +956,8 @@ def test_rodas5_v2_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
         rounds=1,
     )
 
-    assert results.shape == (ensemble_size, system["n_vars"])
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=3e-6)
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=3e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -972,9 +993,10 @@ def test_rodas5_v2_jac_fn_matches_reference(nn_reaction_system):
         atol=1e-8,
     ).block_until_ready()
 
-    assert y_jac.shape == (N, system["n_vars"])
-    np.testing.assert_allclose(y_jac.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_jac, y_ref, rtol=1e-6, atol=1e-9)
+    assert y_jac.shape == (N, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(y_jac[:, 0, :], np.asarray(_broadcast_y0(system["y0"], N)), atol=0.0)
+    np.testing.assert_allclose(y_jac.sum(axis=2), 1.0, atol=3e-6)
+    np.testing.assert_allclose(y_jac[:, -1, :], y_ref, rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
@@ -1010,6 +1032,32 @@ def test_rodas5_v2_fp32_linear_solver_matches_fp64_baseline(nn_reaction_system):
     )
 
 
+@pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
+def test_rodas5_v2_jac_fn_saves_multiple_times(nn_reaction_system):
+    """Validate multiple save times on the jac_fn path."""
+    N = 64
+    system = nn_reaction_system
+    params_batch = _make_params_batch(N, seed=0)
+
+    y_hist = rodas5_v2_solve_ensemble(
+        None,
+        y0=system["y0"],
+        t_span=_V6_MULTI_SAVE_TIMES,
+        params_batch=params_batch,
+        jac_fn=system["jac_array"],
+        linear_solver_precision="fp32",
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+    y_ref = _reference_trajectory(system, params_batch, _V6_MULTI_SAVE_TIMES)
+
+    assert y_hist.shape == (N, len(_V6_MULTI_SAVE_TIMES), system["n_vars"])
+    np.testing.assert_allclose(y_hist[:, 0, :], np.asarray(_broadcast_y0(system["y0"], N)), atol=0.0)
+    np.testing.assert_allclose(y_hist.sum(axis=2), 1.0, atol=3e-6)
+    np.testing.assert_allclose(np.asarray(y_hist), y_ref, rtol=2e-4, atol=3e-8)
+
+
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
 def test_rodas5_v2_jac_fn_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
@@ -1033,8 +1081,8 @@ def test_rodas5_v2_jac_fn_ensemble_N(benchmark, nn_reaction_system, ensemble_siz
         rounds=1,
     )
 
-    assert results.shape == (ensemble_size, system["n_vars"])
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=3e-6)
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=3e-6)
 
 
 @pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)
@@ -1066,5 +1114,5 @@ def test_rodas5_v2_jac_fn_linear_solver_precision_timing(
     )
     benchmark.extra_info["backend"] = jax.default_backend()
 
-    assert results.shape == (ensemble_size, system["n_vars"])
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=3e-6)
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=3e-6)
