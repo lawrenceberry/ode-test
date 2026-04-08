@@ -100,13 +100,13 @@ def test_rodas5_v2_vdp_matches_rodas5_reference():
     ).block_until_ready()
 
     assert y_v2.shape == (N, _N_VARS)
-    assert y_ref.shape == (N, _N_VARS)
+    assert y_ref.shape == (N, len(_T_SPAN), _N_VARS)
 
     # Solutions should be finite.
     assert jnp.all(jnp.isfinite(y_v2))
 
     # Compare against the existing Rodas5 implementation as reference.
-    np.testing.assert_allclose(y_v2, y_ref, rtol=3e-5, atol=3e-8)
+    np.testing.assert_allclose(y_v2, y_ref[:, -1, :], rtol=3e-5, atol=3e-8)
 
 
 @pytest.fixture
@@ -140,7 +140,7 @@ def test_rodas5_vdp_ensemble_N(benchmark, params_batch_vdp):
         rounds=1,
     )
 
-    assert results.shape == (params_batch_vdp.shape[0], _N_VARS)
+    assert results.shape == (params_batch_vdp.shape[0], len(_T_SPAN), _N_VARS)
     assert np.all(np.isfinite(results))
 
 

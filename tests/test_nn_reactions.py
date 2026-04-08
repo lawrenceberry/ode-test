@@ -166,27 +166,17 @@ def _time_exact_trajectory(system, save_times):
 
 
 def _reference_trajectory(system, params_batch, save_times):
-    save_times_np = np.asarray(save_times, dtype=np.float64)
     solve_ref = make_rodas5_solver(system["array"])
-    traj = []
-    for i, tf in enumerate(save_times_np):
-        if i == 0:
-            traj.append(
-                np.broadcast_to(
-                    np.asarray(system["y0"]), (params_batch.shape[0], system["n_vars"])
-                )
-            )
-            continue
-        y_ref = solve_ref(
+    return np.asarray(
+        solve_ref(
             y0=system["y0"],
-            t_span=(float(save_times_np[0]), float(tf)),
+            t_span=save_times,
             params_batch=params_batch,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
         ).block_until_ready()
-        traj.append(np.asarray(y_ref))
-    return np.stack(traj, axis=1)
+    )
 
 
 @pytest.fixture
@@ -225,9 +215,9 @@ def test_rodas5_v2_matches_rodas5_reference(nn_reaction_system):
     ).block_until_ready()
 
     assert y_v2.shape == (N, system["n_vars"])
-    assert y_ref.shape == (N, system["n_vars"])
+    assert y_ref.shape == (N, len(_T_SPAN), system["n_vars"])
     np.testing.assert_allclose(y_v2.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v2, y_ref, rtol=3e-5, atol=3e-8)
+    np.testing.assert_allclose(y_v2, y_ref[:, -1, :], rtol=3e-5, atol=3e-8)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -260,7 +250,7 @@ def test_rodas5_v3_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
 
     assert y_v3.shape == (N, system["n_vars"])
     np.testing.assert_allclose(y_v3.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v3, y_ref, rtol=3e-5, atol=3e-8)
+    np.testing.assert_allclose(y_v3, y_ref[:, -1, :], rtol=3e-5, atol=3e-8)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -283,8 +273,8 @@ def test_rodas5_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
         rounds=1,
     )
 
-    assert results.shape == (ensemble_size, system["n_vars"])
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=3e-6)
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=3e-6)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -481,7 +471,7 @@ def test_rodas5_v4_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
 
     assert y_v4.shape == (N, system["n_vars"])
     np.testing.assert_allclose(y_v4.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v4, np.asarray(y_ref), rtol=3e-5, atol=3e-8)
+    np.testing.assert_allclose(y_v4, np.asarray(y_ref)[:, -1, :], rtol=3e-5, atol=3e-8)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -580,7 +570,7 @@ def test_rodas5_v5_matches_rodas5_reference(nn_reaction_system):
 
     assert y_v5.shape == (N, system["n_vars"])
     np.testing.assert_allclose(y_v5.sum(axis=1), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v5, y_ref, rtol=3e-5, atol=3e-8)
+    np.testing.assert_allclose(y_v5, y_ref[:, -1, :], rtol=3e-5, atol=3e-8)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -968,7 +958,7 @@ def test_rodas5_v2_matches_reference(nn_reaction_system, batch_size):
         y_v2[:, 0, :], np.asarray(_broadcast_y0(system["y0"], N)), atol=0.0
     )
     np.testing.assert_allclose(y_v2.sum(axis=2), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_v2[:, -1, :], y_ref, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(y_v2, y_ref, rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -1032,7 +1022,7 @@ def test_rodas5_v2_jac_fn_matches_reference(nn_reaction_system):
         y_jac[:, 0, :], np.asarray(_broadcast_y0(system["y0"], N)), atol=0.0
     )
     np.testing.assert_allclose(y_jac.sum(axis=2), 1.0, atol=3e-6)
-    np.testing.assert_allclose(y_jac[:, -1, :], y_ref, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(y_jac[:, -1, :], y_ref[:, -1, :], rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("nn_reaction_system", [50], indirect=True, ids=_dim_id)

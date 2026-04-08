@@ -93,7 +93,7 @@ def test_rodas5(benchmark):
             t_span=(0.0, 1e5),
             params_batch=params_batch,
             first_step=1e-4,
-        )[0]
+        )[0, -1]
     )
     y = benchmark.pedantic(
         lambda: _solve().block_until_ready(),
@@ -165,9 +165,9 @@ def test_scipy_bdf_ensemble_N(benchmark, params_batch):
         rounds=1,
     )
 
-    assert results.shape == (params_batch.shape[0], 3)
+    assert results.shape == (params_batch.shape[0], 2, 3)
     # Conservation should hold for every member
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
+    np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=1e-6)
 
 
 def test_rodas5_custom_kernel(benchmark):

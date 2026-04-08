@@ -173,8 +173,8 @@ def test_rodas5_72d_ensemble_N(benchmark, params_batch_72d):
         warmup_rounds=1,
         rounds=1,
     )
-    assert results.shape == (params_batch_72d.shape[0], _N_VARS)
-    np.testing.assert_allclose(results[:, 0], 10.0, atol=1e-3)
+    assert results.shape == (params_batch_72d.shape[0], len(_T_SPAN), _N_VARS)
+    np.testing.assert_allclose(results[:, -1, 0], 10.0, atol=1e-3)
 
 
 @pytest.mark.skipif(not _HAS_JULIA, reason="Julia not installed")

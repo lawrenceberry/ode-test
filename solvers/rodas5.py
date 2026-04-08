@@ -6,6 +6,7 @@ W-transformed variant from Di Marzo (1993) and DISCO-EB (Hahn).
 import functools
 
 import jax
+import numpy as np
 
 jax.config.update("jax_enable_x64", True)  # noqa: E402 - must precede jax.numpy import
 import jax.numpy as jnp  # isort: skip  # noqa: E402
@@ -123,26 +124,32 @@ def _step(f_fn, jac_fn, y, dt):
 def _solve_single(
     f,
     y0,
-    t_span,
+    times,
     *,
     rtol=1e-8,
     atol=1e-10,
     first_step=None,
     max_steps=100000,
 ):
-    """Solve a single stiff autonomous ODE system using Rodas5."""
+    """Solve a single stiff autonomous ODE system at requested save times."""
     y0_arr = jnp.asarray(y0, dtype=jnp.float64)
-    t0, tf = t_span
+    n_vars = y0_arr.shape[0]
+    n_save = times.shape[0]
+    t0 = times[0]
+    tf = times[-1]
     dt0 = jnp.float64(first_step if first_step is not None else (tf - t0) * 1e-6)
     jac_fn = jax.jacobian(f)
+    hist_init = jnp.zeros((n_save, n_vars), dtype=jnp.float64).at[0].set(y0_arr)
+    save_idx_init = jnp.int32(1)
 
     def cond_fn(state):
-        t, _, _, n_steps = state
-        return (t < tf) & (n_steps < max_steps)
+        t, _, _, _, save_idx, n_steps = state
+        return (save_idx < n_save) & (t < tf) & (n_steps < max_steps)
 
     def body_fn(state):
-        t, y, dt, n_steps = state
-        dt = jnp.minimum(dt, tf - t)
+        t, y, dt, hist, save_idx, n_steps = state
+        next_target = times[save_idx]
+        dt = jnp.maximum(jnp.minimum(dt, next_target - t), 1e-30)
 
         y_new, err_est = _step(f, jac_fn, y, dt)
 
@@ -152,6 +159,17 @@ def _solve_single(
         accept = (err_norm <= 1.0) & ~jnp.isnan(err_norm)
         t_new = jnp.where(accept, t + dt, t)
         y_out = jnp.where(accept, y_new, y)
+        reached = accept & (
+            jnp.abs(t_new - next_target)
+            <= 1e-12 * jnp.maximum(1.0, jnp.abs(next_target))
+        )
+        hist_new = jax.lax.cond(
+            reached,
+            lambda h: h.at[save_idx].set(y_out),
+            lambda h: h,
+            hist,
+        )
+        save_idx_new = save_idx + reached.astype(jnp.int32)
 
         safe_err = jnp.where(
             jnp.isnan(err_norm) | (err_norm > 1e18),
@@ -161,22 +179,48 @@ def _solve_single(
         factor = jnp.clip(0.9 * safe_err ** (-1.0 / 6.0), 0.2, 6.0)
         dt_new = dt * factor
 
-        return (t_new, y_out, dt_new, n_steps + 1)
+        return (t_new, y_out, dt_new, hist_new, save_idx_new, n_steps + 1)
 
-    init = (jnp.float64(t0), y0_arr, dt0, jnp.int32(0))
-    _, final_y, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
-    return final_y
+    init = (jnp.float64(t0), y0_arr, dt0, hist_init, save_idx_init, jnp.int32(0))
+    _, _, _, hist_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
+    return hist_final
 
 
 def make_solver(f):
     """Create a reusable Rodas5 ensemble solver.
 
     The returned callable solves an ensemble of trajectories for a fixed ODE
-    right-hand side ``f(y, params)`` and returns only the final state for
-    each trajectory.
+    right-hand side ``f(y, params)`` and returns saved states for each
+    trajectory.
     """
 
     @functools.partial(jax.jit, static_argnames=("max_steps",))
+    def _solve_impl(
+        y0_arr,
+        times,
+        params_batch_arr,
+        *,
+        rtol=1e-8,
+        atol=1e-10,
+        first_step=None,
+        max_steps=100000,
+    ):
+        def _solve_one(params):
+            def f_fn(y):
+                return f(y, params)
+
+            return _solve_single(
+                f_fn,
+                y0_arr,
+                times,
+                rtol=rtol,
+                atol=atol,
+                first_step=first_step,
+                max_steps=max_steps,
+            )
+
+        return jax.vmap(_solve_one)(params_batch_arr)
+
     def _solve(
         y0,
         t_span,
@@ -189,21 +233,26 @@ def make_solver(f):
     ):
         y0_arr = jnp.asarray(y0, dtype=jnp.float64)
         params_batch_arr = jnp.asarray(params_batch)
-
-        def _solve_one(params):
-            def f_fn(y):
-                return f(y, params)
-
-            return _solve_single(
-                f_fn,
-                y0_arr,
-                t_span,
-                rtol=rtol,
-                atol=atol,
-                first_step=first_step,
-                max_steps=max_steps,
+        times = np.asarray(t_span, dtype=np.float64)
+        if times.ndim != 1:
+            raise ValueError(
+                f"t_span must be a 1D array of save times, got shape {times.shape}"
             )
+        if times.size < 2:
+            raise ValueError(
+                f"t_span must contain at least 2 save times, got {times.size}"
+            )
+        if not np.all(np.diff(times) > 0.0):
+            raise ValueError("t_span must be strictly increasing")
 
-        return jax.vmap(_solve_one)(params_batch_arr)
+        return _solve_impl(
+            y0_arr,
+            jnp.asarray(times, dtype=jnp.float64),
+            params_batch_arr,
+            rtol=rtol,
+            atol=atol,
+            first_step=first_step,
+            max_steps=max_steps,
+        )
 
     return _solve
