@@ -109,81 +109,7 @@ def make_solver(
         eye_lu = jnp.eye(n_vars, dtype=lu_dtype)[None, :, :]
         tf = times[-1]
 
-        def _factorize_from_jacobian(jac_lu, dt):
-            dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
-            return lu_factor_batched(dtgamma_inv * eye_lu - jac_lu)
-
-        def _solve_factorized(factorized, rhs):
-            sol = lu_solve_batched(factorized, rhs.astype(lu_dtype))
-            return sol.astype(jnp.float64)
-
-        def _step_with_factored_system(y, dt, f_eval, jac_lu):
-            factorized = _factorize_from_jacobian(jac_lu, dt)
-            inv_dt = (1.0 / dt)[:, None]
-
-            def lu_solve(rhs):
-                return _solve_factorized(factorized, rhs)
-
-            dy = f_eval(y)
-            k1 = lu_solve(dy)
-
-            u = y + _a21 * k1
-            du = f_eval(u)
-            k2 = lu_solve(du + _C21 * k1 * inv_dt)
-
-            u = y + _a31 * k1 + _a32 * k2
-            du = f_eval(u)
-            k3 = lu_solve(du + (_C31 * k1 + _C32 * k2) * inv_dt)
-
-            u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
-            du = f_eval(u)
-            k4 = lu_solve(du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt)
-
-            u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
-            du = f_eval(u)
-            k5 = lu_solve(du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt)
-
-            u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
-            du = f_eval(u)
-            k6 = lu_solve(
-                du
-                + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5) * inv_dt
-            )
-
-            u = u + k6
-            du = f_eval(u)
-            k7 = lu_solve(
-                du
-                + (
-                    _C71 * k1
-                    + _C72 * k2
-                    + _C73 * k3
-                    + _C74 * k4
-                    + _C75 * k5
-                    + _C76 * k6
-                )
-                * inv_dt
-            )
-
-            u = u + k7
-            du = f_eval(u)
-            k8 = lu_solve(
-                du
-                + (
-                    _C81 * k1
-                    + _C82 * k2
-                    + _C83 * k3
-                    + _C84 * k4
-                    + _C85 * k5
-                    + _C86 * k6
-                    + _C87 * k7
-                )
-                * inv_dt
-            )
-
-            return u + k8, k8
-
-        def _solve_chunk(params_chunk):
+        def _solve_batch(params_batch):
             y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
             hist_init = (
                 jnp.zeros((bs, n_save, n_vars), dtype=jnp.float64)
@@ -195,8 +121,13 @@ def make_solver(
             save_idx_init = jnp.ones((bs,), dtype=jnp.int32)
 
             def _step_batch(y, t, dt):
-                jac = _jac_fn_batched(t, params_chunk)
+                jac = _jac_fn_batched(t, params_batch)
+                # Lower precision version of Jacobian for LU factorization and solves
                 jac_lu = jac.astype(lu_dtype)
+
+                dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
+                lu = lu_factor_batched(dtgamma_inv * eye_lu - jac_lu)
+                inv_dt = (1.0 / dt)[:, None]
 
                 def f_eval(u):
                     out = _batched_matvec(
@@ -206,7 +137,71 @@ def make_solver(
                     )
                     return out.astype(jnp.float64)
 
-                return _step_with_factored_system(y, dt, f_eval, jac_lu)
+                def lu_solve(rhs):
+                    sol = lu_solve_batched(lu, rhs.astype(lu_dtype))
+                    return sol.astype(jnp.float64)
+
+                dy = f_eval(y)
+                k1 = lu_solve(dy)
+
+                u = y + _a21 * k1
+                du = f_eval(u)
+                k2 = lu_solve(du + _C21 * k1 * inv_dt)
+
+                u = y + _a31 * k1 + _a32 * k2
+                du = f_eval(u)
+                k3 = lu_solve(du + (_C31 * k1 + _C32 * k2) * inv_dt)
+
+                u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
+                du = f_eval(u)
+                k4 = lu_solve(du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt)
+
+                u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
+                du = f_eval(u)
+                k5 = lu_solve(
+                    du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt
+                )
+
+                u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
+                du = f_eval(u)
+                k6 = lu_solve(
+                    du
+                    + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5)
+                    * inv_dt
+                )
+
+                u = u + k6
+                du = f_eval(u)
+                k7 = lu_solve(
+                    du
+                    + (
+                        _C71 * k1
+                        + _C72 * k2
+                        + _C73 * k3
+                        + _C74 * k4
+                        + _C75 * k5
+                        + _C76 * k6
+                    )
+                    * inv_dt
+                )
+
+                u = u + k7
+                du = f_eval(u)
+                k8 = lu_solve(
+                    du
+                    + (
+                        _C81 * k1
+                        + _C82 * k2
+                        + _C83 * k3
+                        + _C84 * k4
+                        + _C85 * k5
+                        + _C86 * k6
+                        + _C87 * k7
+                    )
+                    * inv_dt
+                )
+
+                return u + k8, k8
 
             def cond_fn(state):
                 t, _, _, _, save_idx, n_steps = state
@@ -256,7 +251,7 @@ def make_solver(
             _, _, _, hist_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
             return hist_final
 
-        return jax.vmap(_solve_chunk)(params_groups)
+        return jax.vmap(_solve_batch)(params_groups)
 
     def _solve(
         y0,
@@ -290,8 +285,8 @@ def make_solver(
         )
         bs = N if batch_size is None else batch_size
 
-        n_chunks = (N + bs - 1) // bs
-        n_padded = n_chunks * bs
+        n_batches = (N + bs - 1) // bs
+        n_padded = n_batches * bs
 
         if n_padded > N:
             pad_rows = jnp.broadcast_to(
@@ -303,7 +298,7 @@ def make_solver(
             params_padded = params_batch_arr
 
         params_groups = params_padded.reshape(
-            (n_chunks, bs) + params_batch_arr.shape[1:]
+            (n_batches, bs) + params_batch_arr.shape[1:]
         )
         results = _solve_impl(
             y0_arr,
