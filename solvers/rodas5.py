@@ -3,6 +3,8 @@
 W-transformed variant from Di Marzo (1993) and DISCO-EB (Hahn).
 """
 
+import functools
+
 import jax
 
 jax.config.update("jax_enable_x64", True)  # noqa: E402 - must precede jax.numpy import
@@ -118,23 +120,17 @@ def _step(f_fn, jac_fn, y, dt):
     return y_new, k8
 
 
-def solve(f, y0, t_span, *, rtol=1e-8, atol=1e-10, first_step=None, max_steps=100000):
-    """Solve a stiff autonomous ODE system using the Rodas5 method.
-
-    This function is JAX-jittable and vmappable (uses jax.lax.while_loop).
-
-    Args:
-        f: JAX function mapping state vector y -> dy/dt.
-        y0: Initial conditions (list or array).
-        t_span: Tuple (t0, tf) for integration bounds.
-        rtol: Relative tolerance.
-        atol: Absolute tolerance.
-        first_step: Initial step size (optional).
-        max_steps: Maximum number of steps.
-
-    Returns:
-        Final state array of shape (n_components,).
-    """
+def _solve_single(
+    f,
+    y0,
+    t_span,
+    *,
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
+):
+    """Solve a single stiff autonomous ODE system using Rodas5."""
     y0_arr = jnp.asarray(y0, dtype=jnp.float64)
     t0, tf = t_span
     dt0 = jnp.float64(first_step if first_step is not None else (tf - t0) * 1e-6)
@@ -172,45 +168,42 @@ def solve(f, y0, t_span, *, rtol=1e-8, atol=1e-10, first_step=None, max_steps=10
     return final_y
 
 
-def solve_ensemble(
-    f,
-    y0,
-    t_span,
-    params_batch,
-    *,
-    rtol=1e-8,
-    atol=1e-10,
-    first_step=None,
-    max_steps=100000,
-):
-    """Solve an ensemble of ODEs with different parameters using vmap.
+def make_solver(f):
+    """Create a reusable Rodas5 ensemble solver.
 
-    Args:
-        f: JAX function (y, params) -> dy/dt.
-        y0: Initial conditions, shared across ensemble.
-        t_span: Tuple (t0, tf), shared across ensemble.
-        params_batch: Array of shape (n_ensemble, ...) with parameters.
-        rtol: Relative tolerance.
-        atol: Absolute tolerance.
-        first_step: Initial step size (optional).
-        max_steps: Maximum number of steps.
-
-    Returns:
-        Array of shape (n_ensemble, n_components) with final states.
+    The returned callable solves an ensemble of trajectories for a fixed ODE
+    right-hand side ``f(y, params)`` and returns only the final state for
+    each trajectory.
     """
 
-    def _solve_one(params):
-        def f_fn(y):
-            return f(y, params)
+    @functools.partial(jax.jit, static_argnames=("max_steps",))
+    def _solve(
+        y0,
+        t_span,
+        params_batch,
+        *,
+        rtol=1e-8,
+        atol=1e-10,
+        first_step=None,
+        max_steps=100000,
+    ):
+        y0_arr = jnp.asarray(y0, dtype=jnp.float64)
+        params_batch_arr = jnp.asarray(params_batch)
 
-        return solve(
-            f_fn,
-            y0,
-            t_span,
-            rtol=rtol,
-            atol=atol,
-            first_step=first_step,
-            max_steps=max_steps,
-        )
+        def _solve_one(params):
+            def f_fn(y):
+                return f(y, params)
 
-    return jax.jit(jax.vmap(_solve_one))(params_batch)
+            return _solve_single(
+                f_fn,
+                y0_arr,
+                t_span,
+                rtol=rtol,
+                atol=atol,
+                first_step=first_step,
+                max_steps=max_steps,
+            )
+
+        return jax.vmap(_solve_one)(params_batch_arr)
+
+    return _solve

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from scipy.linalg import expm
 
-from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
+from solvers.rodas5 import make_solver as make_rodas5_solver
 from solvers.rodas5_custom_kernel_v2 import make_solver as make_rodas5_v2_solver
 from solvers.rodas5_custom_kernel_v3 import make_solver as make_rodas5_v3_solver
 from solvers.rodas5_custom_kernel_v4 import make_solver as make_rodas5_v4_solver
@@ -167,6 +167,7 @@ def _time_exact_trajectory(system, save_times):
 
 def _reference_trajectory(system, params_batch, save_times):
     save_times_np = np.asarray(save_times, dtype=np.float64)
+    solve_ref = make_rodas5_solver(system["array"])
     traj = []
     for i, tf in enumerate(save_times_np):
         if i == 0:
@@ -176,8 +177,7 @@ def _reference_trajectory(system, params_batch, save_times):
                 )
             )
             continue
-        y_ref = rodas5_solve_ensemble(
-            system["array"],
+        y_ref = solve_ref(
             y0=system["y0"],
             t_span=(float(save_times_np[0]), float(tf)),
             params_batch=params_batch,
@@ -205,6 +205,7 @@ def test_rodas5_v2_matches_rodas5_reference(nn_reaction_system):
     params_batch = _make_params_batch(N, seed=0)
 
     solve_v2 = make_rodas5_v2_solver(system["ode"])
+    solve_ref = make_rodas5_solver(system["array"])
     y_v2 = solve_v2(
         y0_batch=y0_batch,
         t_span=_T_SPAN,
@@ -214,8 +215,7 @@ def test_rodas5_v2_matches_rodas5_reference(nn_reaction_system):
         atol=1e-8,
     ).block_until_ready()
 
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -239,6 +239,7 @@ def test_rodas5_v3_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
     y0_batch = _broadcast_y0(system["y0"], N)
 
     solve_v3 = make_rodas5_v3_solver(system["matrix"])
+    solve_ref = make_rodas5_solver(system["array"])
     y_v3 = solve_v3(
         y0_batch=y0_batch,
         t_span=_T_SPAN,
@@ -248,8 +249,7 @@ def test_rodas5_v3_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
     ).block_until_ready()
 
     params_batch = jnp.ones((N, 1), dtype=jnp.float64)
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -269,9 +269,9 @@ def test_rodas5_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
     """Rodas5 vmap ensemble benchmark on the reaction system."""
     system = nn_reaction_system
     params_batch = _make_params_batch(ensemble_size, seed=42)
+    solve = make_rodas5_solver(system["array"])
     results = benchmark.pedantic(
-        lambda: rodas5_solve_ensemble(
-            system["array"],
+        lambda: solve(
             y0=system["y0"],
             t_span=_T_SPAN,
             params_batch=params_batch,
@@ -285,6 +285,36 @@ def test_rodas5_ensemble_N(benchmark, nn_reaction_system, ensemble_size):
 
     assert results.shape == (ensemble_size, system["n_vars"])
     np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=3e-6)
+
+
+@pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
+def test_rodas5_make_solver_matches_solve_ensemble(nn_reaction_system):
+    """Validate separate Rodas5 solver instances agree on the same problem."""
+    N = 100
+    system = nn_reaction_system
+    params_batch = _make_params_batch(N, seed=123)
+
+    solve_a = make_rodas5_solver(system["array"])
+    solve_b = make_rodas5_solver(system["array"])
+    y_a = solve_a(
+        y0=system["y0"],
+        t_span=_T_SPAN,
+        params_batch=params_batch,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+
+    y_b = solve_b(
+        y0=system["y0"],
+        t_span=_T_SPAN,
+        params_batch=params_batch,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+
+    np.testing.assert_allclose(y_a, y_b, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
@@ -430,6 +460,7 @@ def test_rodas5_v4_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
     y0_batch = np.broadcast_to(system["y0_np"], (N, system["n_vars"])).copy()
 
     solve_v4 = make_rodas5_v4_solver(np.asarray(system["matrix"]))
+    solve_ref = make_rodas5_solver(system["array"])
     y_v4 = solve_v4(
         y0_batch=y0_batch,
         t_span=_T_SPAN,
@@ -439,8 +470,7 @@ def test_rodas5_v4_matches_rodas5_reference_for_linear_matrix(nn_reaction_system
     )
 
     params_batch = jnp.ones((N, 1), dtype=jnp.float64)
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -529,6 +559,7 @@ def test_rodas5_v5_matches_rodas5_reference(nn_reaction_system):
     params_batch = _make_params_batch(N, seed=0)
 
     solve_v5 = make_rodas5_v5_solver(system["jac"])
+    solve_ref = make_rodas5_solver(system["array"])
     y_v5 = solve_v5(
         y0_batch=y0_batch,
         t_span=_T_SPAN,
@@ -538,8 +569,7 @@ def test_rodas5_v5_matches_rodas5_reference(nn_reaction_system):
         atol=1e-8,
     ).block_until_ready()
 
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -914,6 +944,7 @@ def test_rodas5_v2_matches_reference(nn_reaction_system, batch_size):
     params_batch = _make_params_batch(N, seed=0)
 
     solve_v2 = make_rodas5_v2_nonlinear_solver(system["array"], batch_size=batch_size)
+    solve_ref = make_rodas5_solver(system["array"])
     y_v2 = solve_v2(
         y0=system["y0"],
         t_span=_T_SPAN,
@@ -923,8 +954,7 @@ def test_rodas5_v2_matches_reference(nn_reaction_system, batch_size):
         atol=1e-8,
     ).block_until_ready()
 
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -978,6 +1008,7 @@ def test_rodas5_v2_jac_fn_matches_reference(nn_reaction_system):
     params_batch = _make_params_batch(N, seed=0)
 
     solve_linear = make_rodas5_v2_linear_solver(system["jac_array"])
+    solve_ref = make_rodas5_solver(system["array"])
     y_jac = solve_linear(
         y0=system["y0"],
         t_span=_T_SPAN,
@@ -987,8 +1018,7 @@ def test_rodas5_v2_jac_fn_matches_reference(nn_reaction_system):
         atol=1e-8,
     ).block_until_ready()
 
-    y_ref = rodas5_solve_ensemble(
-        system["array"],
+    y_ref = solve_ref(
         y0=system["y0"],
         t_span=_T_SPAN,
         params_batch=params_batch,

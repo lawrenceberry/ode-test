@@ -26,7 +26,7 @@ import jax.numpy as jnp  # isort: skip  # noqa: E402
 import numpy as np
 import pytest
 
-from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
+from solvers.rodas5 import make_solver as make_rodas5_solver
 from solvers.rodas5_custom_kernel_v2 import make_solver as make_rodas5_v2_solver
 
 _JULIA_SCRIPT = "benchmarks/boltzmann_72d_julia.jl"
@@ -160,9 +160,9 @@ def test_rodas5_v2_72d_correctness(benchmark):
 )
 def test_rodas5_72d_ensemble_N(benchmark, params_batch_72d):
     """Rodas5 vmap ensemble (rodas5.py solve_ensemble)."""
+    solve = make_rodas5_solver(_boltzmann_72d_array)
     results = benchmark.pedantic(
-        lambda: rodas5_solve_ensemble(
-            _boltzmann_72d_array,
+        lambda: solve(
             y0=_y0_list,
             t_span=_T_SPAN,
             params_batch=params_batch_72d,

@@ -16,7 +16,7 @@ import jax.numpy as jnp  # isort: skip  # noqa: E402
 import numpy as np
 import pytest
 
-from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
+from solvers.rodas5 import make_solver as make_rodas5_solver
 from solvers.rodas5_custom_kernel_v2 import make_solver as make_rodas5_v2_solver
 
 _N_OSC = 35
@@ -79,6 +79,7 @@ def test_rodas5_v2_vdp_matches_rodas5_reference():
     )
 
     solve_v2 = make_rodas5_v2_solver(_vdp_70d_ode)
+    solve_ref = make_rodas5_solver(_vdp_70d_array)
 
     y_v2 = solve_v2(
         y0_batch=y0_batch,
@@ -89,8 +90,7 @@ def test_rodas5_v2_vdp_matches_rodas5_reference():
         atol=1e-8,
     ).block_until_ready()
 
-    y_ref = rodas5_solve_ensemble(
-        _vdp_70d_array,
+    y_ref = solve_ref(
         y0=y0,
         t_span=_T_SPAN,
         params_batch=params_batch,
@@ -126,9 +126,9 @@ def params_batch_vdp(request):
 def test_rodas5_vdp_ensemble_N(benchmark, params_batch_vdp):
     """Rodas5 vmap ensemble benchmark on the 70D van der Pol system."""
     y0 = jnp.array([2.0, 0.0] * _N_OSC, dtype=jnp.float64)
+    solve = make_rodas5_solver(_vdp_70d_array)
     results = benchmark.pedantic(
-        lambda: rodas5_solve_ensemble(
-            _vdp_70d_array,
+        lambda: solve(
             y0=y0,
             t_span=_T_SPAN,
             params_batch=params_batch_vdp,

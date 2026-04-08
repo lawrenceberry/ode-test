@@ -9,8 +9,7 @@ import pytest
 
 from solvers.diffrax_kvaerno5 import solve as kvaerno5_solve
 from solvers.diffrax_kvaerno5 import solve_ensemble as kvaerno5_solve_ensemble
-from solvers.rodas5 import solve as rodas5_solve
-from solvers.rodas5 import solve_ensemble as rodas5_solve_ensemble
+from solvers.rodas5 import make_solver as make_rodas5_solver
 from solvers.rodas5_custom_kernel import solve as rodas5_ck_solve
 from solvers.rodas5_custom_kernel import solve_ensemble as rodas5_ck_solve_ensemble
 from solvers.rodas5_custom_kernel import (
@@ -86,10 +85,15 @@ def test_scipy_bdf(benchmark):
 
 
 def test_rodas5(benchmark):
+    solve = make_rodas5_solver(robertson)
+    params_batch = _STANDARD_PARAMS[None, :]
     _solve = jax.jit(
-        lambda: rodas5_solve(
-            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-        )
+        lambda: solve(
+            y0=[1.0, 0.0, 0.0],
+            t_span=(0.0, 1e5),
+            params_batch=params_batch,
+            first_step=1e-4,
+        )[0]
     )
     y = benchmark.pedantic(
         lambda: _solve().block_until_ready(),
@@ -206,9 +210,9 @@ def test_rodas5_custom_kernel_ensemble_N(benchmark, params_batch):
 
 @pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
 def test_rodas5_ensemble_N(benchmark, params_batch):
+    solve = make_rodas5_solver(robertson)
     results = benchmark.pedantic(
-        lambda: rodas5_solve_ensemble(
-            robertson,
+        lambda: solve(
             y0=[1.0, 0.0, 0.0],
             t_span=(0.0, 1e5),
             params_batch=params_batch,
