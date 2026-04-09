@@ -10,13 +10,6 @@ import pytest
 from solvers.diffrax_kvaerno5 import solve as kvaerno5_solve
 from solvers.diffrax_kvaerno5 import solve_ensemble as kvaerno5_solve_ensemble
 from solvers.rodas5 import make_solver as make_rodas5_solver
-from solvers.rodas5_custom_kernel import solve as rodas5_ck_solve
-from solvers.rodas5_custom_kernel import solve_ensemble as rodas5_ck_solve_ensemble
-from solvers.rodas5_custom_kernel import (
-    solve_ensemble_pallas as rodas5_ck_pallas_solve_ensemble,
-)
-from solvers.rodas5_custom_kernel_v2 import make_solver as make_rodas5_v2_solver
-from solvers.rosenbrock23_custom_kernel import make_solver as make_rb23_solver
 from solvers.scipy_bdf import solve as scipy_bdf_solve
 from solvers.scipy_bdf import solve_ensemble as scipy_bdf_solve_ensemble
 
@@ -170,44 +163,6 @@ def test_scipy_bdf_ensemble_N(benchmark, params_batch):
     np.testing.assert_allclose(results.sum(axis=2), 1.0, atol=1e-6)
 
 
-def test_rodas5_custom_kernel(benchmark):
-    _solve = jax.jit(
-        lambda: rodas5_ck_solve(
-            robertson, y0=[1.0, 0.0, 0.0], t_span=(0.0, 1e5), first_step=1e-4
-        )
-    )
-    y = benchmark.pedantic(
-        lambda: _solve().block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    np.testing.assert_allclose(y.sum(), 1.0, atol=1e-6)
-    np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-4)
-    np.testing.assert_allclose(y[1], 7.274753e-08, rtol=1e-4)
-    np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-4)
-
-
-@pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
-def test_rodas5_custom_kernel_ensemble_N(benchmark, params_batch):
-    results = benchmark.pedantic(
-        lambda: rodas5_ck_solve_ensemble(
-            robertson,
-            y0=[1.0, 0.0, 0.0],
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (params_batch.shape[0], 3)
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
-
-
 @pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
 def test_rodas5_ensemble_N(benchmark, params_batch):
     solve = make_rodas5_solver(robertson)
@@ -226,114 +181,6 @@ def test_rodas5_ensemble_N(benchmark, params_batch):
 
     assert results.shape == (params_batch.shape[0], 3)
     # Conservation should hold for every member
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
-
-
-@pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
-def test_rodas5_pallas_ensemble_N(benchmark, params_batch):
-    results = benchmark.pedantic(
-        lambda: rodas5_ck_pallas_solve_ensemble(
-            y0=[1.0, 0.0, 0.0],
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (params_batch.shape[0], 3)
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
-
-
-def test_rosenbrock23_custom_kernel(benchmark):
-    solve = make_rb23_solver(_robertson_ode)
-    params_batch = _STANDARD_PARAMS[None, :]  # single-element batch
-    y0_batch = jnp.array([[1.0, 0.0, 0.0]])
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0_batch=y0_batch,
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    y = results[0]
-    np.testing.assert_allclose(y.sum(), 1.0, atol=1e-6)
-    np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-3)
-    np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-3)
-
-
-@pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
-def test_rosenbrock23_pallas_ensemble_N(benchmark, params_batch):
-    solve = make_rb23_solver(_robertson_ode)
-    y0_batch = jnp.broadcast_to(jnp.array([1.0, 0.0, 0.0]), (params_batch.shape[0], 3))
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0_batch=y0_batch,
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (params_batch.shape[0], 3)
-    np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
-
-
-def test_rodas5_v2_custom_kernel(benchmark):
-    solve = make_rodas5_v2_solver(_robertson_ode)
-    params_batch = _STANDARD_PARAMS[None, :]  # single-element batch
-    y0_batch = jnp.array([[1.0, 0.0, 0.0]])
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0_batch=y0_batch,
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    y = results[0]
-    np.testing.assert_allclose(y.sum(), 1.0, atol=1e-6)
-    np.testing.assert_allclose(y[0], 1.786592e-02, rtol=1e-4)
-    np.testing.assert_allclose(y[1], 7.274753e-08, rtol=1e-4)
-    np.testing.assert_allclose(y[2], 9.821340e-01, rtol=1e-4)
-
-
-@pytest.mark.parametrize("params_batch", [2, 100, 1000, 10000, 100_000], indirect=True)
-def test_rodas5_v2_pallas_ensemble_N(benchmark, params_batch):
-    solve = make_rodas5_v2_solver(_robertson_ode)
-    y0_batch = jnp.broadcast_to(jnp.array([1.0, 0.0, 0.0]), (params_batch.shape[0], 3))
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0_batch=y0_batch,
-            t_span=(0.0, 1e5),
-            params_batch=params_batch,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (params_batch.shape[0], 3)
     np.testing.assert_allclose(results.sum(axis=1), 1.0, atol=1e-6)
 
 
