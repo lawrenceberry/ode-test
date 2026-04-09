@@ -1,17 +1,26 @@
-"""Rodas5 solver — single-loop batched variant for nonlinear ODEs.
+"""Rodas5 solver — single-loop batched variant supporting linear and nonlinear ODEs.
 
-Solves dy/dt = f(y, params) using Rodas5 (order 5) with Jacobian computed
-via automatic differentiation at every step.
+Two usage modes selected via mutually exclusive keyword arguments:
+
+* **jac_fn** (linear mode): supply ``jac_fn(t, params) -> [n_vars, n_vars]``.
+  The Jacobian depends on time and parameters but NOT on the current state y.
+  f_eval is computed as a matrix-vector product using the supplied Jacobian.
+
+* **ode_fn** (nonlinear mode): supply ``ode_fn(y, t, params) -> dy/dt``.
+  The Jacobian is recomputed at every step via ``jax.jacfwd``.
+
+Exactly one of ``ode_fn`` or ``jac_fn`` must be provided.
 
 Uses a single jax.lax.while_loop with the batch dimension inside the loop
 body instead of vmap-over-while-loop.
 
 The batch_size parameter controls how many trajectories share a while loop.
 batch_size=N (default) puts all trajectories in one loop; batch_size=1
-recovers the vmap-over-while-loop behaviour of rodas5.py.
+recovers the vmap-over-while-loop behaviour of scalar_rodas5.py.
 """
 
 import functools
+from typing import Literal
 
 import jax
 import numpy as np
@@ -41,128 +50,76 @@ _C71 = 34.20013733472935;  _C72 = -14.15535402717690;  _C73 = 57.82335640988400;
 _C81 = 42.57076742291101;  _C82 = -13.80770672017997;  _C83 = 93.98938432427124;   _C84 = 18.77919633714503;  _C85 = -31.58359187223370;  _C86 = -6.685968952921985;  _C87 = -5.810979938412932
 # fmt: on
 
-_SUPPORTED_LINEAR_SOLVER_PRECISIONS = ("fp64", "fp32")
+_BATCHED_DOT_DIMENSION_NUMBERS = (((2,), (1,)), ((0,), (0,)))
+
+
+def _batched_matvec(mat, vec, *, precision):
+    out = lax.dot(
+        mat,
+        vec[..., None],
+        dimension_numbers=_BATCHED_DOT_DIMENSION_NUMBERS,
+        precision=precision,
+    )
+    return out[..., 0]
 
 
 def make_solver(
-    f,
-    *,
-    linear_solver_precision="fp64",
+    ode_fn=None,
+    jac_fn=None,
+    lu_precision: Literal["fp32", "fp64"] = "fp64",
+    mv_precision: Literal["fp32", "fp64"] = "fp64",
     batch_size=None,
 ):
-    """Create a reusable Rodas5 ensemble solver for nonlinear ODEs.
+    """Create a reusable Rodas5 ensemble solver for linear or nonlinear ODEs.
 
     Parameters
     ----------
-    f : callable
-        ODE right-hand side with signature ``f(y, params) -> dy/dt``.
-    linear_solver_precision : str
-        Precision for LU factorization and solve: ``"fp64"`` or ``"fp32"``.
+    ode_fn : callable, optional
+        ODE right-hand side with signature ``ode_fn(y, t, params) -> dy/dt``.
+        The Jacobian is recomputed at every step via ``jax.jacfwd``.
+        Mutually exclusive with ``jac_fn``.
+    jac_fn : callable, optional
+        Jacobian function with signature ``jac_fn(t, params) -> [n_vars, n_vars]``.
+        The Jacobian may depend on time and parameters but must not depend on
+        the current state y.  f_eval is implemented as a matrix-vector product.
+        Mutually exclusive with ``ode_fn``.
+    lu_precision :
+        Precision for LU factorization, LU solve, and matrix-vector products:
+        ``"fp64"`` or ``"fp32"``.
     batch_size : int or None
-        Number of trajectories per while-loop chunk.  ``None`` (default)
+        Number of trajectories per while-loop batch.  ``None`` (default)
         puts all trajectories in a single loop.
     """
-    if linear_solver_precision not in _SUPPORTED_LINEAR_SOLVER_PRECISIONS:
-        raise ValueError(
-            "linear_solver_precision must be one of "
-            f"{_SUPPORTED_LINEAR_SOLVER_PRECISIONS}, got {linear_solver_precision!r}"
-        )
+    if (ode_fn is None) == (jac_fn is None):
+        raise ValueError("Exactly one of ode_fn or jac_fn must be provided")
 
-    lu_dtype = jnp.float32 if linear_solver_precision == "fp32" else jnp.float64
+    lu_dtype = jnp.float32 if lu_precision == "fp32" else jnp.float64
+    mv_dtype = jnp.float32 if mv_precision == "fp32" else jnp.float64
 
     lu_factor_batched = jax.vmap(jax.scipy.linalg.lu_factor)
     lu_solve_batched = jax.vmap(jax.scipy.linalg.lu_solve)
 
-    _f_batched = jax.vmap(f)
-    _jac_batched = jax.vmap(lambda y, p: jax.jacfwd(lambda y_: f(y_, p))(y))
+    if ode_fn is not None:
+        _ode_batched = jax.vmap(ode_fn)
+        _jac_batched = jax.vmap(
+            lambda y, t, p: jax.jacfwd(lambda y_: ode_fn(y_, t, p))(y)
+        )
+    else:
+        _jac_batched = jax.vmap(lambda _, t, p: jac_fn(t, p), in_axes=(0, 0, 0))
 
     @functools.partial(
         jax.jit,
         static_argnames=("n_save", "max_steps"),
     )
     def _solve_impl(
-        y0_arr, params_groups, times, *, n_save, max_steps, dt0, rtol, atol
+        y0_arr, params_batches, times, *, n_save, max_steps, dt0, rtol, atol
     ):
         n_vars = y0_arr.shape[0]
-        bs = params_groups.shape[1]
-        eye_lu = jnp.eye(n_vars, dtype=lu_dtype)[None, :, :]
+        bs = params_batches.shape[1]
+        eye = jnp.eye(n_vars, dtype=lu_dtype)[None, :, :]
         tf = times[-1]
 
-        def _factorize_from_jacobian(jac_lu, dt):
-            dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
-            return lu_factor_batched(dtgamma_inv * eye_lu - jac_lu)
-
-        def _solve_factorized(factorized, rhs):
-            sol = lu_solve_batched(factorized, rhs.astype(lu_dtype))
-            return sol.astype(jnp.float64)
-
-        def _step_with_factored_system(y, dt, f_eval, jac_lu):
-            factorized = _factorize_from_jacobian(jac_lu, dt)
-            inv_dt = (1.0 / dt)[:, None]
-
-            def lu_solve(rhs):
-                return _solve_factorized(factorized, rhs)
-
-            dy = f_eval(y)
-            k1 = lu_solve(dy)
-
-            u = y + _a21 * k1
-            du = f_eval(u)
-            k2 = lu_solve(du + _C21 * k1 * inv_dt)
-
-            u = y + _a31 * k1 + _a32 * k2
-            du = f_eval(u)
-            k3 = lu_solve(du + (_C31 * k1 + _C32 * k2) * inv_dt)
-
-            u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
-            du = f_eval(u)
-            k4 = lu_solve(du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt)
-
-            u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
-            du = f_eval(u)
-            k5 = lu_solve(du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt)
-
-            u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
-            du = f_eval(u)
-            k6 = lu_solve(
-                du
-                + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5) * inv_dt
-            )
-
-            u = u + k6
-            du = f_eval(u)
-            k7 = lu_solve(
-                du
-                + (
-                    _C71 * k1
-                    + _C72 * k2
-                    + _C73 * k3
-                    + _C74 * k4
-                    + _C75 * k5
-                    + _C76 * k6
-                )
-                * inv_dt
-            )
-
-            u = u + k7
-            du = f_eval(u)
-            k8 = lu_solve(
-                du
-                + (
-                    _C81 * k1
-                    + _C82 * k2
-                    + _C83 * k3
-                    + _C84 * k4
-                    + _C85 * k5
-                    + _C86 * k6
-                    + _C87 * k7
-                )
-                * inv_dt
-            )
-
-            return u + k8, k8
-
-        def _solve_chunk(params_chunk):
+        def _solve_batch(params_batch):
             y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
             hist_init = (
                 jnp.zeros((bs, n_save, n_vars), dtype=jnp.float64)
@@ -173,14 +130,95 @@ def make_solver(
             dt_init = jnp.full((bs,), dt0, dtype=jnp.float64)
             save_idx_init = jnp.ones((bs,), dtype=jnp.int32)
 
-            def _step_batch(y, dt):
-                jac = _jac_batched(y, params_chunk)
+            def _step_batch(y, t, dt):
+                jac = _jac_batched(y, t, params_batch)
                 jac_lu = jac.astype(lu_dtype)
+                jac_mv = jac.astype(mv_dtype)
+                dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
+                lu = lu_factor_batched(dtgamma_inv * eye - jac_lu)
+                inv_dt = (1.0 / dt)[:, None]
 
-                def f_eval(u):
-                    return _f_batched(u, params_chunk)
+                if ode_fn is not None:
 
-                return _step_with_factored_system(y, dt, f_eval, jac_lu)
+                    def f_eval(u):
+                        return _ode_batched(u, t, params_batch)
+                else:
+
+                    def f_eval(u):
+                        out = _batched_matvec(
+                            jac_mv,
+                            u.astype(mv_dtype),
+                            precision=lax.DotAlgorithmPreset.TF32_TF32_F32
+                            if mv_precision == "fp32" and jax.default_backend() != "cpu"
+                            else lax.Precision.DEFAULT,
+                        )
+                        return out.astype(jnp.float64)
+
+                def lu_solve(rhs):
+                    sol = lu_solve_batched(lu, rhs.astype(lu_dtype))
+                    return sol.astype(jnp.float64)
+
+                dy = f_eval(y)
+                k1 = lu_solve(dy)
+
+                u = y + _a21 * k1
+                du = f_eval(u)
+                k2 = lu_solve(du + _C21 * k1 * inv_dt)
+
+                u = y + _a31 * k1 + _a32 * k2
+                du = f_eval(u)
+                k3 = lu_solve(du + (_C31 * k1 + _C32 * k2) * inv_dt)
+
+                u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
+                du = f_eval(u)
+                k4 = lu_solve(du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt)
+
+                u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
+                du = f_eval(u)
+                k5 = lu_solve(
+                    du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt
+                )
+
+                u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
+                du = f_eval(u)
+                k6 = lu_solve(
+                    du
+                    + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5)
+                    * inv_dt
+                )
+
+                u = u + k6
+                du = f_eval(u)
+                k7 = lu_solve(
+                    du
+                    + (
+                        _C71 * k1
+                        + _C72 * k2
+                        + _C73 * k3
+                        + _C74 * k4
+                        + _C75 * k5
+                        + _C76 * k6
+                    )
+                    * inv_dt
+                )
+
+                u = u + k7
+                du = f_eval(u)
+                k8 = lu_solve(
+                    du
+                    + (
+                        _C81 * k1
+                        + _C82 * k2
+                        + _C83 * k3
+                        + _C84 * k4
+                        + _C85 * k5
+                        + _C86 * k6
+                        + _C87 * k7
+                    )
+                    * inv_dt
+                )
+
+                return u + k8, k8
 
             def cond_fn(state):
                 t, _, _, _, save_idx, n_steps = state
@@ -197,7 +235,7 @@ def make_solver(
                     1e-30,
                 )
 
-                y_new, err_est = _step_batch(y, dt_use)
+                y_new, err_est = _step_batch(y, t, dt_use)
 
                 scale = atol + rtol * jnp.maximum(jnp.abs(y), jnp.abs(y_new))
                 err_norm = jnp.sqrt(jnp.mean((err_est / scale) ** 2, axis=1))
@@ -230,12 +268,12 @@ def make_solver(
             _, _, _, hist_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
             return hist_final
 
-        return jax.vmap(_solve_chunk)(params_groups)
+        return jax.vmap(_solve_batch)(params_batches)
 
     def _solve(
         y0,
         t_span,
-        params_batch,
+        params,
         *,
         rtol=1e-8,
         atol=1e-10,
@@ -243,9 +281,9 @@ def make_solver(
         max_steps=100000,
     ):
         y0_arr = jnp.asarray(y0, dtype=jnp.float64)
-        params_batch_arr = jnp.asarray(params_batch)
+        params_arr = jnp.asarray(params)
         n_vars = int(y0_arr.shape[0])
-        N = int(params_batch_arr.shape[0])
+        N = int(params_arr.shape[0])
         times = np.asarray(t_span, dtype=np.float64)
         if times.ndim != 1:
             raise ValueError(
@@ -269,19 +307,17 @@ def make_solver(
 
         if n_padded > N:
             pad_rows = jnp.broadcast_to(
-                params_batch_arr[-1:],
-                (n_padded - N,) + params_batch_arr.shape[1:],
+                params_arr[-1:],
+                (n_padded - N,) + params_arr.shape[1:],
             )
-            params_padded = jnp.concatenate([params_batch_arr, pad_rows], axis=0)
+            params_padded = jnp.concatenate([params_arr, pad_rows], axis=0)
         else:
-            params_padded = params_batch_arr
+            params_padded = params_arr
 
-        params_groups = params_padded.reshape(
-            (n_chunks, bs) + params_batch_arr.shape[1:]
-        )
+        params_batches = params_padded.reshape((n_chunks, bs) + params_arr.shape[1:])
         results = _solve_impl(
             y0_arr,
-            params_groups,
+            params_batches,
             times_jnp,
             n_save=int(times.size),
             max_steps=int(max_steps),
