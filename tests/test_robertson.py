@@ -7,11 +7,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.diffrax_kvaerno5 import solve as kvaerno5_solve
-from solvers.diffrax_kvaerno5 import solve_ensemble as kvaerno5_solve_ensemble
-from solvers.rodas5 import make_solver as make_rodas5_solver
-from solvers.scipy_bdf import solve as scipy_bdf_solve
-from solvers.scipy_bdf import solve_ensemble as scipy_bdf_solve_ensemble
+from tests.reference_solvers.python.diffrax_kvaerno5 import solve as kvaerno5_solve
+from tests.reference_solvers.python.diffrax_kvaerno5 import (
+    solve_ensemble as kvaerno5_solve_ensemble,
+)
+from tests.reference_solvers.python.scalar_rodas5 import (
+    make_solver as make_rodas5_solver,
+)
 
 _JULIA_SCRIPT = "benchmarks/robertson_julia.jl"
 _HAS_JULIA = shutil.which("julia") is not None

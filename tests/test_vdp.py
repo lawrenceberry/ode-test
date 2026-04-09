@@ -16,7 +16,9 @@ import jax.numpy as jnp  # isort: skip  # noqa: E402
 import numpy as np
 import pytest
 
-from solvers.rodas5 import make_solver as make_rodas5_solver
+from tests.reference_solvers.python.scalar_rodas5 import (
+    make_solver as make_rodas5_solver,
+)
 
 _N_OSC = 35
 _N_VARS = 2 * _N_OSC  # 70: (x_i, v_i) for each oscillator

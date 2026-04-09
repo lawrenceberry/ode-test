@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 from scipy.linalg import expm
 
-from solvers.rodas5 import make_solver as make_rodas5_solver
 from solvers.rodas5_v2_linear import make_solver as make_rodas5_v2_linear_solver
 from solvers.rodas5_v2_nonlinear import make_solver as make_rodas5_v2_nonlinear_solver
+from tests.reference_solvers.python.scalar_rodas5 import (
+    make_solver as make_rodas5_solver,
+)
 
 _T_SPAN = (0.0, 1.0)
 _V6_MULTI_SAVE_TIMES = jnp.array((0.0, 0.125, 0.25, 0.5, 1.0), dtype=jnp.float64)

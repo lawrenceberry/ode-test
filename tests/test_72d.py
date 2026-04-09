@@ -26,7 +26,9 @@ import jax.numpy as jnp  # isort: skip  # noqa: E402
 import numpy as np
 import pytest
 
-from solvers.rodas5 import make_solver as make_rodas5_solver
+from tests.reference_solvers.python.scalar_rodas5 import (
+    make_solver as make_rodas5_solver,
+)
 
 _JULIA_SCRIPT = "benchmarks/boltzmann_72d_julia.jl"
 _HAS_JULIA = shutil.which("julia") is not None
