@@ -42,12 +42,12 @@ def _make_params_batch(size, seed):
 
 
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-@pytest.mark.parametrize("precision", ["fp32", "fp64"])
-def test_rodas5_nonlinear(benchmark, ensemble_size, precision):
+@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
+def test_rodas5_nonlinear(benchmark, ensemble_size, lu_precision):
     """Rodas5 nonlinear ensemble benchmark on the Robertson stiff system."""
     system = _make_robertson_system()
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_rodas5_nonlinear(ode_fn=system["ode_fn"], lu_precision=precision)
+    solve = make_rodas5_nonlinear(ode_fn=system["ode_fn"], lu_precision=lu_precision)
     results = benchmark.pedantic(
         lambda: solve(
             y0=system["y0"],
