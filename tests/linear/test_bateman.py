@@ -54,7 +54,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from solvers.linear.kencarp5_linear import make_solver as make_kencarp5_linear
 from solvers.linear.rodas5_linear import make_solver as make_rodas5_linear
+from solvers.nonlinear.kencarp5_nonlinear import make_solver as make_kencarp5_nonlinear
 from solvers.nonlinear.rodas5_nonlinear import make_solver as make_rodas5_nonlinear
 from tests.reference_solvers.python.diffrax_kvaerno5 import (
     make_solver as make_kvaerno5_solver,
@@ -101,11 +103,29 @@ def _make_bateman_system(n_vars, stiffness):
         del t
         return p[0] * M
 
+    def explicit_jac_fn(t, p):
+        del t, p
+        return jnp.zeros_like(M)
+
+    def implicit_jac_fn(t, p):
+        return jac_fn(t, p)
+
+    def explicit_ode_fn(y, t, p):
+        del y, t, p
+        return jnp.zeros_like(y0)
+
+    def implicit_ode_fn(y, t, p):
+        return ode_fn(y, t, p)
+
     return {
         "n_vars": n_vars,
         "stiffness": stiffness,
         "ode_fn": ode_fn,
         "jac_fn": jac_fn,
+        "explicit_ode_fn": explicit_ode_fn,
+        "implicit_ode_fn": implicit_ode_fn,
+        "explicit_jac_fn": explicit_jac_fn,
+        "implicit_jac_fn": implicit_jac_fn,
         "y0": y0,
         "M_np": M_np,
     }
@@ -200,6 +220,44 @@ def test_rodas5_linear(benchmark, bateman_system, ensemble_size, lu_precision):
     np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "bateman_system",
+    [(n, s) for n in _SYSTEM_DIMS for s in _STIFFNESS_RATIOS],
+    indirect=True,
+    ids=_system_id,
+)
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
+def test_kencarp5_linear(benchmark, bateman_system, ensemble_size, lu_precision):
+    """KenCarp5 linear benchmark with conservation and exact-solution validation."""
+    system = bateman_system
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_kencarp5_linear(
+        explicit_jac_fn=system["explicit_jac_fn"],
+        implicit_jac_fn=system["implicit_jac_fn"],
+        lu_precision=lu_precision,
+    )
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+    results_np = np.asarray(results)
+
+    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
+    assert np.all(np.isfinite(results_np))
+    np.testing.assert_allclose(results_np.sum(axis=-1), 1.0, atol=3e-6)
+    y_exact = _exact_solution(system["M_np"], np.asarray(system["y0"]), _TIMES, params)
+    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Nonlinear solver (ode_fn path)
 # ---------------------------------------------------------------------------
@@ -218,6 +276,44 @@ def test_rodas5_nonlinear(benchmark, bateman_system, ensemble_size, lu_precision
     system = bateman_system
     params = _make_params_batch(ensemble_size, seed=42)
     solve = make_rodas5_nonlinear(ode_fn=system["ode_fn"], lu_precision=lu_precision)
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+    results_np = np.asarray(results)
+
+    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
+    assert np.all(np.isfinite(results_np))
+    np.testing.assert_allclose(results_np.sum(axis=-1), 1.0, atol=3e-6)
+    y_exact = _exact_solution(system["M_np"], np.asarray(system["y0"]), _TIMES, params)
+    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "bateman_system",
+    [(n, s) for n in _SYSTEM_DIMS for s in _STIFFNESS_RATIOS],
+    indirect=True,
+    ids=_system_id,
+)
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
+def test_kencarp5_nonlinear(benchmark, bateman_system, ensemble_size, lu_precision):
+    """KenCarp5 nonlinear benchmark with conservation and exact-solution validation."""
+    system = bateman_system
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_kencarp5_nonlinear(
+        explicit_ode_fn=system["explicit_ode_fn"],
+        implicit_ode_fn=system["implicit_ode_fn"],
+        lu_precision=lu_precision,
+    )
     results = benchmark.pedantic(
         lambda: solve(
             y0=system["y0"],

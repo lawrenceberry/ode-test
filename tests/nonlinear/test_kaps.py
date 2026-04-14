@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from solvers.nonlinear.kencarp5_nonlinear import make_solver as make_kencarp5_nonlinear
 from solvers.nonlinear.rodas5_nonlinear import make_solver as make_rodas5_nonlinear
 from tests.reference_solvers.python.diffrax_kvaerno5 import (
     make_solver as make_kvaerno5_solver,
@@ -64,11 +65,31 @@ def _make_kaps_system(n_pairs, epsilon_min):
         dy2 = s * (y1 - y2 - y2**2)
         return jnp.stack([dy1, dy2], axis=1).ravel()
 
+    def explicit_ode_fn(y, t, p):
+        del t
+        s = p[0]
+        y1 = y[0::2]
+        y2 = y[1::2]
+        dy1 = s * (-2.0 * y1)
+        dy2 = s * (y1 - y2 - y2**2)
+        return jnp.stack([dy1, dy2], axis=1).ravel()
+
+    def implicit_ode_fn(y, t, p):
+        del t
+        s = p[0]
+        y1 = y[0::2]
+        y2 = y[1::2]
+        dy1 = s * (-(1.0 / epsilon) * (y1 - y2**2))
+        dy2 = jnp.zeros_like(y2)
+        return jnp.stack([dy1, dy2], axis=1).ravel()
+
     return {
         "n_pairs": n_pairs,
         "epsilon_min": epsilon_min,
         "n_vars": n_vars,
         "ode_fn": ode_fn,
+        "explicit_ode_fn": explicit_ode_fn,
+        "implicit_ode_fn": implicit_ode_fn,
         "y0": y0,
     }
 
@@ -116,6 +137,43 @@ def test_rodas5_nonlinear(benchmark, kaps_system, ensemble_size, lu_precision):
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
     solve = make_rodas5_nonlinear(ode_fn=system["ode_fn"], lu_precision=lu_precision)
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+    results_np = np.asarray(results)
+
+    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
+    assert np.all(np.isfinite(results_np))
+    y_exact = _exact_solution(_TIMES, params, system["n_pairs"])
+    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "kaps_system",
+    [(n, e) for n in _N_PAIRS for e in _EPSILON_MIN],
+    indirect=True,
+    ids=lambda p: f"{p[0]}pairs-eps{p[1]:.0e}",
+)
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
+def test_kencarp5_nonlinear(benchmark, kaps_system, ensemble_size, lu_precision):
+    """KenCarp5 nonlinear benchmark with exact-solution validation."""
+    system = kaps_system
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_kencarp5_nonlinear(
+        explicit_ode_fn=system["explicit_ode_fn"],
+        implicit_ode_fn=system["implicit_ode_fn"],
+        lu_precision=lu_precision,
+    )
     results = benchmark.pedantic(
         lambda: solve(
             y0=system["y0"],
