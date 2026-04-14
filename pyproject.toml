@@ -16,8 +16,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = [
+cuda12 = [
     "jax[cuda12]>=0.9.1",
+]
+cuda13 = [
+    "jax[cuda13]>=0.9.1",
 ]
 
 [dependency-groups]
