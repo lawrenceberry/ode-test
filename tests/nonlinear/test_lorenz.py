@@ -25,7 +25,6 @@ Parameter perturbations are ±5% around ρ = 28.  All values land in [26.6, 29.4
 well above the chaos onset, so every ensemble member is fully chaotic.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -34,6 +33,9 @@ from solvers.nonlinear.rodas5_nonlinear import make_solver as make_rodas5_nonlin
 from solvers.nonlinear.tsit5_nonlinear import make_solver as make_tsit5_nonlinear
 from tests.reference_solvers.python.diffrax_kvaerno5 import (
     make_solver as make_kvaerno5_solver,
+)
+from tests.reference_solvers.python.diffrax_tsit5 import (
+    make_solver as make_diffrax_tsit5_solver,
 )
 
 _T_SPAN = (0.0, 5.0)
@@ -45,10 +47,6 @@ _X_MAX = 40.0
 _Y_MAX = 40.0
 _Z_MIN = -1.0  # z stays non-negative; small slack for numerical noise
 _Z_MAX = 65.0
-_GPU_ONLY = pytest.mark.skipif(
-    jax.default_backend() != "gpu",
-    reason="Tsit5 validation is GPU-only",
-)
 
 
 def _make_lorenz_system():
@@ -123,7 +121,6 @@ def test_rodas5_nonlinear(benchmark, ensemble_size, lu_precision):
     _assert_on_attractor(np.asarray(results[:, -1, :]))
 
 
-@_GPU_ONLY
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
 def test_tsit5_nonlinear(benchmark, ensemble_size):
     """Tsit5 nonlinear ensemble benchmark on the Lorenz system."""
@@ -134,6 +131,31 @@ def test_tsit5_nonlinear(benchmark, ensemble_size):
         lambda: solve(
             y0=system["y0"],
             t_span=_T_SPAN,
+            params=params,
+            first_step=1e-4,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    assert np.all(np.isfinite(results))
+    _assert_on_attractor(np.asarray(results[:, -1, :]))
+
+
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+def test_diffrax_tsit5(benchmark, ensemble_size):
+    """Diffrax Tsit5 benchmark with attractor-confinement validation."""
+    system = _make_lorenz_system()
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_diffrax_tsit5_solver(system["ode_fn"])
+    t_span = jnp.array(list(_T_SPAN), dtype=jnp.float64)
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=t_span,
             params=params,
             first_step=1e-4,
             rtol=1e-6,
@@ -181,7 +203,6 @@ def test_rodas5_nonlinear_stays_on_attractor(ensemble_size, lu_precision):
         _assert_on_attractor(np.asarray(y[:, t_idx, :]))
 
 
-@_GPU_ONLY
 @pytest.mark.parametrize("ensemble_size", [2])
 def test_tsit5_nonlinear_stays_on_attractor(ensemble_size):
     """Verify Tsit5 trajectories remain on the attractor manifold over t ∈ [0, 20]."""

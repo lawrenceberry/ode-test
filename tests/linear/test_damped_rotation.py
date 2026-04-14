@@ -13,21 +13,19 @@ This makes the problem well suited to an explicit RK method, and the exact
 solution is available in closed form for direct validation.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from solvers.linear.tsit5_linear import make_solver as make_tsit5_linear
 from solvers.nonlinear.tsit5_nonlinear import make_solver as make_tsit5_nonlinear
+from tests.reference_solvers.python.diffrax_tsit5 import (
+    make_solver as make_diffrax_tsit5_solver,
+)
 
 _TIMES = jnp.array((0.0, 0.25, 0.5, 0.75, 1.0), dtype=jnp.float64)
 _N_PAIRS = [15, 25, 35]  # equation pairs → 30D, 50D, 70D
 _ENSEMBLE_SIZES = [2, 100, 1000, 10000]
-pytestmark = pytest.mark.skipif(
-    jax.default_backend() != "gpu",
-    reason="Tsit5 validation is GPU-only",
-)
 
 
 def _make_damped_rotation_system(n_pairs):
@@ -154,6 +152,38 @@ def test_tsit5_nonlinear_on_linear_system(benchmark, damped_rotation_system, ens
     system = damped_rotation_system
     params = _make_params_batch(ensemble_size, seed=42)
     solve = make_tsit5_nonlinear(ode_fn=system["ode_fn"])
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-4,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+    results_np = np.asarray(results)
+    y_exact = _exact_solution(system, _TIMES, params)
+
+    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
+    assert np.all(np.isfinite(results_np))
+    np.testing.assert_allclose(results_np, y_exact, rtol=2e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "damped_rotation_system",
+    _N_PAIRS,
+    indirect=True,
+    ids=lambda n_pairs: f"{2 * n_pairs}d",
+)
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+def test_diffrax_tsit5(benchmark, damped_rotation_system, ensemble_size):
+    """Diffrax Tsit5 benchmark on the same damped rotation systems."""
+    system = damped_rotation_system
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_diffrax_tsit5_solver(system["ode_fn"])
     results = benchmark.pedantic(
         lambda: solve(
             y0=system["y0"],
