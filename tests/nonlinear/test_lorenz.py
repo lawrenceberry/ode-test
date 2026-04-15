@@ -1,6 +1,7 @@
-"""Tests for the Rodas5 nonlinear solver on the Lorenz chaotic system.
+"""
+Tests on the Lorenz chaotic system.
 
-The Lorenz system:
+Summary:
     dx/dt = σ(y − x)
     dy/dt = x(ρ − z) − y
     dz/dt = xy − βz
@@ -8,8 +9,6 @@ The Lorenz system:
 with σ = 10, β = 8/3 fixed and ρ as the ensemble parameter (centred at 28,
 the standard chaotic regime; chaos onset at ρ ≈ 24.74).
 
-What this tests — long-term integration stability
--------------------------------------------------
 The Lorenz attractor is a strange attractor: trajectories orbit it forever but
 never repeat.  The maximum Lyapunov exponent λ ≈ 0.9 means that two initially
 close trajectories diverge on a timescale of ~1/λ ≈ 1 time unit, so there is
@@ -23,6 +22,9 @@ These bounds are the signature of a solver that stays on the manifold.
 
 Parameter perturbations are ±5% around ρ = 28.  All values land in [26.6, 29.4],
 well above the chaos onset, so every ensemble member is fully chaotic.
+
+Stiffness properties:
+The Lorenz system is nonstiff for ρ ≈ 28, so explicit methods are appropriate.
 """
 
 import jax.numpy as jnp
