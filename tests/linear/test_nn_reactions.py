@@ -36,9 +36,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
 )
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
-)
 
 _TIMES = jnp.array((0.0, 0.125, 0.25, 0.5, 1.0), dtype=jnp.float64)
 _SYSTEM_DIMS = [5, 10, 30, 50, 70]
@@ -285,26 +282,6 @@ def test_diffrax_kvaerno5(benchmark, nn_reaction_system, ensemble_size):
     results_np = np.asarray(results)
 
     assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=3e-6)
-
-
-@pytest.mark.parametrize("nn_reaction_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(benchmark, nn_reaction_system, ensemble_size, ensemble_backend):
-    """Julia Tsit5 benchmark with mass-conservation validation."""
-    system, results_np = _run_julia_nn(
-        benchmark,
-        make_julia_tsit5_solver,
-        nn_reaction_system,
-        ensemble_size,
-        ensemble_backend,
-    )
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=3e-6)
 
 

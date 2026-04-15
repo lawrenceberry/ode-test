@@ -41,9 +41,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
 )
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
-)
 
 _TIMES = jnp.array((0.0, 0.5, 1.0, 2.0), dtype=jnp.float64)
 _N_PAIRS = [15, 25, 35]  # equation pairs → 30D, 50D, 70D
@@ -307,29 +304,6 @@ def test_diffrax_kvaerno5(benchmark, kaps_system, ensemble_size):
     results_np = np.asarray(results)
 
     assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    y_exact = _exact_solution(_TIMES, params, system["n_pairs"])
-    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "kaps_system",
-    [(n, e) for n in _N_PAIRS for e in _EPSILON_MIN],
-    indirect=True,
-    ids=lambda p: f"{p[0]}pairs-eps{p[1]:.0e}",
-)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(benchmark, kaps_system, ensemble_size, ensemble_backend):
-    """Julia Tsit5 benchmark with exact-solution validation."""
-    system, results_np, params = _run_julia_kaps(
-        benchmark, make_julia_tsit5_solver, kaps_system, ensemble_size, ensemble_backend
-    )
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     assert np.all(np.isfinite(results_np))
     y_exact = _exact_solution(_TIMES, params, system["n_pairs"])
     np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)

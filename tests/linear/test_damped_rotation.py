@@ -1,4 +1,4 @@
-"""Tests for Tsit5 linear and nonlinear solvers on damped rotation systems.
+"""Tests for linear and nonlinear solvers on damped rotation systems.
 
 Damped rotation — nonstiff linear dynamics with an exact closed-form solution
 
@@ -18,12 +18,8 @@ import numpy as np
 import pytest
 
 from solvers.kencarp5 import make_solver as make_kencarp5
-from solvers.tsit5 import make_solver as make_tsit5
 from tests.reference_solvers.python.diffrax_kencarp5 import (
     make_solver as make_diffrax_kencarp5_solver,
-)
-from tests.reference_solvers.python.diffrax_tsit5 import (
-    make_solver as make_diffrax_tsit5_solver,
 )
 from tests.reference_solvers.python.julia_common import (
     JULIA_ENSEMBLE_BACKENDS,
@@ -39,9 +35,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 )
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
-)
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
 )
 
 _TIMES = jnp.array((0.0, 0.25, 0.5, 0.75, 1.0), dtype=jnp.float64)
@@ -153,38 +146,6 @@ def _run_julia_damped_rotation(
     ids=lambda n_pairs: f"{2 * n_pairs}d",
 )
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_tsit5(benchmark, damped_rotation_system, ensemble_size):
-    """Tsit5 nonlinear benchmark on the same linear system."""
-    system = damped_rotation_system
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_tsit5(ode_fn=system["ode_fn"])
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-    results_np = np.asarray(results)
-    y_exact = _exact_solution(system, _TIMES, params)
-
-    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    np.testing.assert_allclose(results_np, y_exact, rtol=2e-4, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "damped_rotation_system",
-    _N_PAIRS,
-    indirect=True,
-    ids=lambda n_pairs: f"{2 * n_pairs}d",
-)
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
 @pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
 def test_kencarp5(benchmark, damped_rotation_system, ensemble_size, lu_precision):
     """KenCarp5 nonlinear benchmark on the same linear system."""
@@ -262,72 +223,6 @@ def test_diffrax_kencarp5(benchmark, damped_rotation_system, ensemble_size):
     ids=lambda n_pairs: f"{2 * n_pairs}d",
 )
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_diffrax_tsit5(benchmark, damped_rotation_system, ensemble_size):
-    """Diffrax Tsit5 benchmark on the same damped rotation systems."""
-    system = damped_rotation_system
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_tsit5_solver(system["ode_fn"])
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-    results_np = np.asarray(results)
-    y_exact = _exact_solution(system, _TIMES, params)
-
-    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    np.testing.assert_allclose(results_np, y_exact, rtol=2e-4, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "damped_rotation_system",
-    _N_PAIRS,
-    indirect=True,
-    ids=lambda n_pairs: f"{2 * n_pairs}d",
-)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(
-    benchmark, damped_rotation_system, ensemble_size, ensemble_backend
-):
-    """Julia Tsit5 benchmark on the same damped rotation systems."""
-    system, results_np, params = _run_julia_damped_rotation(
-        benchmark,
-        make_julia_tsit5_solver,
-        damped_rotation_system,
-        ensemble_size,
-        ensemble_backend,
-    )
-    y_exact = _exact_solution(system, _TIMES, params)
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    np.testing.assert_allclose(results_np, y_exact, rtol=2e-4, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "damped_rotation_system",
-    _N_PAIRS,
-    indirect=True,
-    ids=lambda n_pairs: f"{2 * n_pairs}d",
-)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
 def test_julia_kencarp5(
     benchmark, damped_rotation_system, ensemble_size, ensemble_backend
 ):

@@ -60,9 +60,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
 )
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
-)
 
 _TIMES = jnp.array((0.0, 0.025, 0.05, 0.075, 0.1), dtype=jnp.float64)
 _SYSTEM_DIMS = [30, 50, 70]
@@ -298,25 +295,6 @@ def test_diffrax_kvaerno5(benchmark, heat_system, ensemble_size):
     y_exact = _exact_solution(system["n_vars"], _TIMES, params)
 
     assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    assert np.all(results_np >= -1e-6)
-    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
-
-
-@pytest.mark.parametrize("heat_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(benchmark, heat_system, ensemble_size, ensemble_backend):
-    """Julia Tsit5 benchmark with exact-solution validation."""
-    system, results_np, params = _run_julia_heat(
-        benchmark, make_julia_tsit5_solver, heat_system, ensemble_size, ensemble_backend
-    )
-    y_exact = _exact_solution(system["n_vars"], _TIMES, params)
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     assert np.all(np.isfinite(results_np))
     assert np.all(results_np >= -1e-6)
     np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)

@@ -77,9 +77,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
 )
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
-)
 
 _TIMES = jnp.array((0.0, 0.2, 0.5, 1.0, 2.0), dtype=jnp.float64)
 _SYSTEM_DIMS = [30, 50, 70]  # chain lengths (species count including stable)
@@ -355,34 +352,6 @@ def test_diffrax_kvaerno5(benchmark, bateman_system, ensemble_size):
     assert np.all(np.isfinite(results_np))
     np.testing.assert_allclose(results_np.sum(axis=-1), 1.0, atol=3e-6)
     y_exact = _exact_solution(system["M_np"], np.asarray(system["y0"]), _TIMES, params)
-    np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "bateman_system",
-    [(n, s) for n in _SYSTEM_DIMS for s in _STIFFNESS_RATIOS],
-    indirect=True,
-    ids=_system_id,
-)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(benchmark, bateman_system, ensemble_size, ensemble_backend):
-    """Julia Tsit5 benchmark on Bateman decay chains."""
-    system, results_np, params = _run_julia_bateman(
-        benchmark,
-        make_julia_tsit5_solver,
-        bateman_system,
-        ensemble_size,
-        ensemble_backend,
-    )
-    y_exact = _exact_solution(system["M_np"], np.asarray(system["y0"]), _TIMES, params)
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    np.testing.assert_allclose(results_np.sum(axis=-1), 1.0, atol=3e-6)
     np.testing.assert_allclose(results_np, y_exact, rtol=1e-3, atol=1e-6)
 
 

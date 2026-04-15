@@ -72,9 +72,6 @@ from tests.reference_solvers.python.julia_kvaerno5 import (
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
 )
-from tests.reference_solvers.python.julia_tsit5 import (
-    make_solver as make_julia_tsit5_solver,
-)
 
 _DIFFUSION_COEFF = 2e-2
 _ADSORPTION_RATE = 3e4
@@ -408,31 +405,6 @@ def test_diffrax_kvaerno5(benchmark, reversible_trapping_system, ensemble_size):
     results_np = np.asarray(results)
 
     assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-    np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=3e-6)
-
-
-@pytest.mark.parametrize(
-    "reversible_trapping_system", _SYSTEM_DIMS, indirect=True, ids=_dim_id
-)
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(
-    benchmark, reversible_trapping_system, ensemble_size, ensemble_backend
-):
-    """Julia Tsit5 benchmark with mass-conservation validation."""
-    system, results_np = _run_julia_reversible_trapping(
-        benchmark,
-        make_julia_tsit5_solver,
-        reversible_trapping_system,
-        ensemble_size,
-        ensemble_backend,
-    )
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     assert np.all(np.isfinite(results_np))
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=3e-6)
 
