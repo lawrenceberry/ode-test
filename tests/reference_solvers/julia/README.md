@@ -22,9 +22,9 @@ In this test harness:
 
 - `Tsit5` runs as `Tsit5()` on `EnsembleGPUArray` and `GPUTsit5()` on `EnsembleGPUKernel`.
 - `Kvaerno5` runs as `Kvaerno5()` on `EnsembleGPUArray` and `GPUKvaerno5()` on `EnsembleGPUKernel`.
-- `Rodas5` runs only on `EnsembleGPUArray`; the kernel case is skipped from Python because
-  `GPURodas5P()` is not compiling reliably for these reference problems under the current
-  DiffEqGPU kernel path.
+- `Rodas5` runs as `Rodas5()` on `EnsembleGPUArray` and can run as `GPURodas5P()` on
+  `EnsembleGPUKernel` for a limited validated subset in this harness:
+  `stiff_scalar` and `nn_reactions` with `n_vars=5`.
 - `KenCarp5` runs only on `EnsembleGPUArray`; the kernel case is skipped from Python with
   an explicit reason.
 

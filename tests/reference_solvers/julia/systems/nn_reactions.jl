@@ -46,22 +46,27 @@ function make_nn_reactions_spec(config)
         return nothing
     end
 
-    function kernel_ode(u, p, t)
-        scale = p[1]
-        return SVector{n_vars, Float64}(ntuple(n_vars) do i
-            if i == 1
-                scale * (-kf[1] * u[1] + kb[1] * u[2])
-            elseif i == n_vars
-                scale * (kf[end] * u[n_vars - 1] - kb[end] * u[n_vars])
-            else
-                scale * (
-                    kf[i - 1] * u[i - 1] -
-                    (kb[i - 1] + kf[i]) * u[i] +
-                    kb[i] * u[i + 1]
-                )
-            end
-        end)
+    function make_kernel_ode(::Val{N}, kf_vals, kb_vals) where {N}
+        function kernel_ode(u, p, t)
+            scale = p[1]
+            return SVector{N, eltype(u)}(ntuple(Val(N)) do i
+                if i == 1
+                    scale * (-kf_vals[1] * u[1] + kb_vals[1] * u[2])
+                elseif i == N
+                    scale * (kf_vals[end] * u[N - 1] - kb_vals[end] * u[N])
+                else
+                    scale * (
+                        kf_vals[i - 1] * u[i - 1] -
+                        (kb_vals[i - 1] + kf_vals[i]) * u[i] +
+                        kb_vals[i] * u[i + 1]
+                    )
+                end
+            end)
+        end
+        return kernel_ode
     end
+
+    kernel_ode = make_kernel_ode(Val(n_vars), kf, kb)
 
     return ReferenceSystemSpec(
         build_array_full_problem=(y0, tspan, p0) -> SciMLBase.ODEProblem(

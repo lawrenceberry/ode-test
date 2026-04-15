@@ -24,7 +24,7 @@ JULIA_ENSEMBLE_BACKENDS = ("EnsembleGPUArray", "EnsembleGPUKernel")
 _SUPPORTED_SOLVER_BACKENDS = {
     "tsit5": set(JULIA_ENSEMBLE_BACKENDS),
     "kvaerno5": set(JULIA_ENSEMBLE_BACKENDS),
-    "rodas5": {"EnsembleGPUArray"},
+    "rodas5": set(JULIA_ENSEMBLE_BACKENDS),
     "kencarp5": {"EnsembleGPUArray"},
 }
 
@@ -92,8 +92,13 @@ def make_solver(
     ensemble_backend: str = "EnsembleGPUArray",
 ):
     """Create a Julia subprocess solver with the usual Python test signature."""
-    require_julia_reference_support(solver_name, ensemble_backend)
     system_config_dict = {} if system_config is None else dict(system_config)
+    require_julia_reference_support(
+        solver_name,
+        ensemble_backend,
+        system_name=system_name,
+        system_config=system_config_dict,
+    )
 
     def _solve(
         y0,
@@ -104,7 +109,7 @@ def make_solver(
         atol=1e-10,
         first_step=None,
         max_steps=100000,
-        ):
+    ):
         result = _run_julia_solver(
             solver_name,
             system_name,
@@ -149,7 +154,13 @@ def make_solver(
     return _solve
 
 
-def require_julia_reference_support(solver_name: str, ensemble_backend: str) -> None:
+def require_julia_reference_support(
+    solver_name: str,
+    ensemble_backend: str,
+    *,
+    system_name: str | None = None,
+    system_config: dict | None = None,
+) -> None:
     """Skip cleanly when the requested Julia solver/backend cannot run here."""
     supported = _SUPPORTED_SOLVER_BACKENDS.get(solver_name)
     if supported is None:
@@ -191,7 +202,7 @@ def _check_julia_environment():
         (
             "using JSON, CUDA, DiffEqGPU, OrdinaryDiffEq, SciMLBase, StaticArrays; "
             "CUDA.functional(true); "
-            "println(\"ok\")"
+            'println("ok")'
         ),
     ]
     completed = subprocess.run(
