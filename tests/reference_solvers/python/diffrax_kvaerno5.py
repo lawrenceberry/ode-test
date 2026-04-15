@@ -1,5 +1,6 @@
 """Kvaerno5 solver via diffrax — ESDIRK method of order 5 for stiff ODEs."""
 
+import functools
 import hashlib
 import inspect
 import json
@@ -260,6 +261,30 @@ def make_solver(ode_fn):
         ODE right-hand side with signature ``ode_fn(y, t, params) -> dy/dt``.
     """
 
+    @functools.partial(jax.jit, static_argnames=("max_steps",))
+    def _solve_impl(y0_arr, save_times, params_arr, *, rtol, atol, dt0, max_steps):
+        t0 = save_times[0]
+        tf = save_times[-1]
+
+        def _solve_one(p):
+            term = diffrax.ODETerm(lambda t, y, args: ode_fn(y, t, p))
+            solver = diffrax.Kvaerno5()
+            controller = diffrax.PIDController(rtol=rtol, atol=atol)
+            sol = diffrax.diffeqsolve(
+                term,
+                solver,
+                t0=t0,
+                t1=tf,
+                dt0=dt0,
+                y0=y0_arr,
+                stepsize_controller=controller,
+                max_steps=max_steps,
+                saveat=diffrax.SaveAt(ts=save_times),
+            )
+            return sol.ys
+
+        return jax.vmap(_solve_one)(params_arr)
+
     def _solve(
         y0,
         t_span,
@@ -287,17 +312,18 @@ def make_solver(ode_fn):
         """
         y0_arr = jnp.asarray(y0, dtype=jnp.float64)
         params_arr = jnp.asarray(params)
-        save_times = jnp.asarray(
-            np.asarray(t_span, dtype=np.float64), dtype=jnp.float64
+        times_np = np.asarray(t_span, dtype=np.float64)
+        save_times = jnp.asarray(times_np, dtype=jnp.float64)
+        dt0 = jnp.float64(
+            first_step if first_step is not None else (times_np[-1] - times_np[0]) * 1e-6
         )
-        return _solve_with_diffrax(
-            ode_fn,
+        return _solve_impl(
             y0_arr,
             save_times,
             params_arr,
             rtol=rtol,
             atol=atol,
-            first_step=first_step,
+            dt0=dt0,
             max_steps=max_steps,
         )
 
