@@ -265,7 +265,7 @@ def make_solver(
 
             if linear:
 
-                def _newton_stage(base, t_stage, dt, predictor):
+                def _newton_stage(base, t_stage, dt, predictor):  # pyright: ignore[reportRedeclaration]
                     gamma_dt = dt * _GAMMA
                     jac = _jac_batched(predictor, t_stage, params_batch)
                     mask = gershgorin_stiff_mask(jac, dt, gershgorin_scale)
