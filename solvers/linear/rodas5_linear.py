@@ -39,6 +39,13 @@ _C51 = -20.69865579590063; _C52 = -8.816374604402768;  _C53 = 1.260436877740897;
 _C61 = -46.22004352711257; _C62 = -17.49534862857472;  _C63 = -289.6389582892057;  _C64 = 93.60855400400906;  _C65 = 318.3822534212147
 _C71 = 34.20013733472935;  _C72 = -14.15535402717690;  _C73 = 57.82335640988400;   _C74 = 25.83362985412365;  _C75 = 1.408950972071624;  _C76 = -6.551835421242162
 _C81 = 42.57076742291101;  _C82 = -13.80770672017997;  _C83 = 93.98938432427124;   _C84 = 18.77919633714503;  _C85 = -31.58359187223370;  _C86 = -6.685968952921985;  _C87 = -5.810979938412932
+
+# Stage time coefficients for non-autonomous ODEs: t_stage = t + c_i * dt
+_c2 = 0.38
+_c3 = 0.3878509998321533
+_c4 = 0.4839718937873840
+_c5 = 0.4570477008819580
+# c6 = c7 = c8 = 1.0
 # fmt: on
 
 _BATCHED_DOT_DIMENSION_NUMBERS = (((2,), (1,)), ((0,), (0,)))
@@ -82,7 +89,7 @@ def make_solver(
     lu_factor_batched = jax.vmap(jax.scipy.linalg.lu_factor)
     lu_solve_batched = jax.vmap(jax.scipy.linalg.lu_solve)
 
-    _jac_batched = jax.vmap(lambda _, t, p: jac_fn(t, p), in_axes=(0, 0, 0))
+    _jac_at_batched = jax.vmap(lambda t, p: jac_fn(t, p), in_axes=(0, 0))
 
     @functools.partial(
         jax.jit,
@@ -108,20 +115,31 @@ def make_solver(
             save_idx_init = jnp.ones((bs,), dtype=jnp.int32)
 
             def _step_batch(y, t, dt):
-                jac = _jac_batched(y, t, params_batch)
-                jac_lu = jac.astype(lu_dtype)
-                jac_mv = jac.astype(mv_dtype)
+                # Precompute Jacobians at each distinct stage time.
+                # W is factored at t0; f_eval at each stage uses J(t_stage).
+                t_end = t + dt
+                jac_0 = _jac_at_batched(t, params_batch)
+                jac_c2 = _jac_at_batched(t + _c2 * dt, params_batch)
+                jac_c3 = _jac_at_batched(t + _c3 * dt, params_batch)
+                jac_c4 = _jac_at_batched(t + _c4 * dt, params_batch)
+                jac_c5 = _jac_at_batched(t + _c5 * dt, params_batch)
+                jac_1 = _jac_at_batched(t_end, params_batch)
+
                 dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)[:, None, None]
-                lu = lu_factor_batched(dtgamma_inv * eye - jac_lu)
+                lu = lu_factor_batched(dtgamma_inv * eye - jac_0.astype(lu_dtype))
                 inv_dt = (1.0 / dt)[:, None]
 
-                def f_eval(u):
+                _precision = (
+                    lax.DotAlgorithmPreset.TF32_TF32_F32
+                    if mv_precision == "fp32" and jax.default_backend() != "cpu"
+                    else lax.Precision.DEFAULT
+                )
+
+                def f_eval(u, jac_mv):
                     out = _batched_matvec(
                         jac_mv,
                         u.astype(mv_dtype),
-                        precision=lax.DotAlgorithmPreset.TF32_TF32_F32
-                        if mv_precision == "fp32" and jax.default_backend() != "cpu"
-                        else lax.Precision.DEFAULT,
+                        precision=_precision,
                     )
                     return out.astype(jnp.float64)
 
@@ -129,29 +147,30 @@ def make_solver(
                     sol = lu_solve_batched(lu, rhs.astype(lu_dtype))
                     return sol.astype(jnp.float64)
 
-                dy = f_eval(y)
+                dy = f_eval(y, jac_0.astype(mv_dtype))
                 k1 = lu_solve(dy)
 
                 u = y + _a21 * k1
-                du = f_eval(u)
+                du = f_eval(u, jac_c2.astype(mv_dtype))
                 k2 = lu_solve(du + _C21 * k1 * inv_dt)
 
                 u = y + _a31 * k1 + _a32 * k2
-                du = f_eval(u)
+                du = f_eval(u, jac_c3.astype(mv_dtype))
                 k3 = lu_solve(du + (_C31 * k1 + _C32 * k2) * inv_dt)
 
                 u = y + _a41 * k1 + _a42 * k2 + _a43 * k3
-                du = f_eval(u)
+                du = f_eval(u, jac_c4.astype(mv_dtype))
                 k4 = lu_solve(du + (_C41 * k1 + _C42 * k2 + _C43 * k3) * inv_dt)
 
                 u = y + _a51 * k1 + _a52 * k2 + _a53 * k3 + _a54 * k4
-                du = f_eval(u)
+                du = f_eval(u, jac_c5.astype(mv_dtype))
                 k5 = lu_solve(
                     du + (_C51 * k1 + _C52 * k2 + _C53 * k3 + _C54 * k4) * inv_dt
                 )
 
+                jac_1_mv = jac_1.astype(mv_dtype)
                 u = y + _a61 * k1 + _a62 * k2 + _a63 * k3 + _a64 * k4 + _a65 * k5
-                du = f_eval(u)
+                du = f_eval(u, jac_1_mv)
                 k6 = lu_solve(
                     du
                     + (_C61 * k1 + _C62 * k2 + _C63 * k3 + _C64 * k4 + _C65 * k5)
@@ -159,7 +178,7 @@ def make_solver(
                 )
 
                 u = u + k6
-                du = f_eval(u)
+                du = f_eval(u, jac_1_mv)
                 k7 = lu_solve(
                     du
                     + (
@@ -174,7 +193,7 @@ def make_solver(
                 )
 
                 u = u + k7
-                du = f_eval(u)
+                du = f_eval(u, jac_1_mv)
                 k8 = lu_solve(
                     du
                     + (
