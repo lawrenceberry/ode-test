@@ -96,6 +96,79 @@ _FACTOR_MAX = 10.0
 _NEWTON_MAX_ITERS = 10
 
 
+def _row_partition(mask):
+    """Return a stable inactive-first permutation and its inverse.
+
+    Rows where ``mask`` is False come first; True (active) rows come last.
+    """
+    perm = jnp.argsort(mask.astype(jnp.int32), axis=-1, stable=True)
+    inv_perm = jnp.argsort(perm, axis=-1)
+    n_active = jnp.sum(mask, axis=-1, dtype=jnp.int32)
+    return perm, inv_perm, n_active
+
+
+def _permute_vector(vec, perm):
+    return jnp.take_along_axis(vec, perm, axis=-1)
+
+
+def _unpermute_vector(vec_perm, inv_perm):
+    return jnp.take_along_axis(vec_perm, inv_perm, axis=-1)
+
+
+def _permute_matrix(mat, perm):
+    mat_rows = jnp.take_along_axis(mat, perm[..., :, None], axis=-2)
+    return jnp.take_along_axis(mat_rows, perm[..., None, :], axis=-1)
+
+
+def _make_reduced_implicit_solver(n_vars, lu_dtype):
+    """Solve ``(I - coeff * J) x = rhs`` with a per-trajectory reduced LU.
+
+    Rows where ``mask`` is False are inactive: their implicit Jacobian rows
+    are zero, so ``x_i = rhs_i`` by direct substitution.  Active rows form a
+    k×k sub-system solved by LU, with coupling from inactive columns included
+    in the RHS.  ``lax.switch`` is used to select the right branch at runtime
+    while keeping XLA slice sizes static.
+    """
+
+    @functools.partial(jax.vmap, in_axes=(0, 0, 0, 0))
+    def _solve_single(jac_perm, rhs_perm, n_active, coeff):
+        branches = []
+        for active_size in range(n_vars + 1):
+            n_inactive = n_vars - active_size
+
+            def _branch(args, *, _k=active_size, _ni=n_inactive):
+                jac_perm, rhs_perm, coeff = args
+                if _k == 0:
+                    return rhs_perm
+                x_inactive = rhs_perm[:_ni]
+                jac_an = jac_perm[_ni:, :_ni]
+                jac_aa = jac_perm[_ni:, _ni:]
+                mat_aa = jnp.eye(_k, dtype=lu_dtype) - coeff.astype(
+                    lu_dtype
+                ) * jac_aa.astype(lu_dtype)
+                rhs_active = rhs_perm[_ni:] + coeff * (
+                    jac_an.astype(jnp.float64) @ x_inactive.astype(jnp.float64)
+                )
+                lu_piv = jax.scipy.linalg.lu_factor(mat_aa)
+                x_active = jax.scipy.linalg.lu_solve(
+                    lu_piv, rhs_active.astype(lu_dtype)
+                ).astype(jnp.float64)
+                return jnp.concatenate((x_inactive, x_active), axis=0)
+
+            branches.append(_branch)
+
+        return jax.lax.switch(n_active, branches, (jac_perm, rhs_perm, coeff))
+
+    def _solve_batched(jac, rhs, mask, coeff):
+        perm, inv_perm, n_active = _row_partition(mask)
+        jac_perm = _permute_matrix(jac, perm)
+        rhs_perm = _permute_vector(rhs, perm)
+        x_perm = _solve_single(jac_perm, rhs_perm, n_active, coeff)
+        return _unpermute_vector(x_perm, inv_perm)
+
+    return _solve_batched
+
+
 def make_solver(
     explicit_ode_fn,
     implicit_ode_fn,
@@ -110,8 +183,6 @@ def make_solver(
     """
     lu_dtype = jnp.float32 if lu_precision == "fp32" else jnp.float64
 
-    lu_factor_batched = jax.vmap(jax.scipy.linalg.lu_factor)
-    lu_solve_batched = jax.vmap(jax.scipy.linalg.lu_solve)
     _explicit_batched = jax.vmap(explicit_ode_fn)
     _implicit_batched = jax.vmap(implicit_ode_fn)
     _implicit_jac_fn = jax.jacfwd(implicit_ode_fn, argnums=0)
@@ -123,7 +194,7 @@ def make_solver(
     ):
         n_vars = y0_arr.shape[0]
         bs = params_batches.shape[1]
-        eye = jnp.eye(n_vars, dtype=lu_dtype)[None, :, :]
+        solve_row_masked = _make_reduced_implicit_solver(n_vars, lu_dtype)
         tf = times[-1]
 
         def _solve_batch(params_batch):
@@ -142,13 +213,8 @@ def make_solver(
                 def _newton_stage(base, t_stage, dt, predictor):
                     gamma_dt = dt * _GAMMA
                     jac = _implicit_jac_batched(predictor, t_stage, params_batch)
-                    mat = eye - gamma_dt.astype(lu_dtype)[:, None, None] * jac.astype(
-                        lu_dtype
-                    )
-                    lu = lu_factor_batched(mat)
-                    u_stage = lu_solve_batched(lu, base.astype(lu_dtype)).astype(
-                        jnp.float64
-                    )
+                    mask = jnp.any(jac != 0.0, axis=2)
+                    u_stage = solve_row_masked(jac, base, mask, gamma_dt)
                     fi_stage = _implicit_batched(u_stage, t_stage, params_batch)
                     failed = (
                         jnp.any(~jnp.isfinite(jac), axis=(1, 2))
@@ -162,54 +228,72 @@ def make_solver(
                 def _newton_stage(base, t_stage, dt, predictor):
                     gamma_dt = dt * _GAMMA
 
-                    def cond_fn(state):
-                        _, converged, failed, it = state
-                        return (jnp.any(~(converged | failed))) & (
-                            it < _NEWTON_MAX_ITERS
-                        )
+                    # Evaluate J at the predictor once to detect which rows have
+                    # nonzero implicit coupling.  Rows with all-zero Jacobian rows
+                    # are "inactive": their implicit RHS is u-independent, so they
+                    # are resolved by direct substitution without entering Newton.
+                    jac_pred = _implicit_jac_batched(predictor, t_stage, params_batch)
+                    mask = jnp.any(jac_pred != 0.0, axis=2)  # (bs, n) per-trajectory
 
-                    def body_fn(state):
-                        u, converged, failed, it = state
-                        fi = _implicit_batched(u, t_stage, params_batch)
-                        res = u - base - gamma_dt[:, None] * fi
-                        jac = _implicit_jac_batched(u, t_stage, params_batch)
-                        mat = eye - gamma_dt.astype(lu_dtype)[:, None, None] * jac.astype(
-                            lu_dtype
-                        )
-                        lu = lu_factor_batched(mat)
-                        delta = lu_solve_batched(lu, res.astype(lu_dtype)).astype(
-                            jnp.float64
-                        )
-                        u_new = jnp.where(
-                            (converged | failed)[:, None],
-                            u,
-                            u - delta,
-                        )
-                        scale = atol + rtol * jnp.maximum(jnp.abs(u), jnp.abs(u_new))
-                        delta_norm = jnp.sqrt(jnp.mean((delta / scale) ** 2, axis=1))
-                        invalid = (
-                            jnp.any(~jnp.isfinite(u_new), axis=1)
-                            | jnp.any(~jnp.isfinite(delta), axis=1)
-                            | jnp.isnan(delta_norm)
-                        )
-                        converged_new = converged | ((delta_norm <= 1.0) & ~invalid)
-                        failed_new = failed | invalid
-                        return (u_new, converged_new, failed_new, it + 1)
+                    def direct_fn(_):
+                        # All rows inactive: one f_impl eval, no LU, no loop.
+                        fi = _implicit_batched(predictor, t_stage, params_batch)
+                        u = base + gamma_dt[:, None] * fi
+                        return u, fi, jnp.zeros((bs,), jnp.bool_)
 
-                    init = (
-                        predictor,
-                        jnp.zeros((bs,), dtype=jnp.bool_),
-                        jnp.zeros((bs,), dtype=jnp.bool_),
-                        jnp.int32(0),
+                    def newton_fn(_):
+                        def cond_fn(state):
+                            _, converged, failed, it = state
+                            return (jnp.any(~(converged | failed))) & (
+                                it < _NEWTON_MAX_ITERS
+                            )
+
+                        def body_fn(state):
+                            u, converged, failed, it = state
+                            fi = _implicit_batched(u, t_stage, params_batch)
+                            res = u - base - gamma_dt[:, None] * fi
+                            jac = _implicit_jac_batched(u, t_stage, params_batch)
+                            # Reduced solve: inactive rows → delta_i = res_i (direct),
+                            # active rows → k×k Newton step with coupling correction.
+                            delta = solve_row_masked(jac, res, mask, gamma_dt)
+                            u_new = jnp.where(
+                                (converged | failed)[:, None],
+                                u,
+                                u - delta,
+                            )
+                            scale = atol + rtol * jnp.maximum(
+                                jnp.abs(u), jnp.abs(u_new)
+                            )
+                            delta_norm = jnp.sqrt(
+                                jnp.mean((delta / scale) ** 2, axis=1)
+                            )
+                            invalid = (
+                                jnp.any(~jnp.isfinite(u_new), axis=1)
+                                | jnp.any(~jnp.isfinite(delta), axis=1)
+                                | jnp.isnan(delta_norm)
+                            )
+                            converged_new = converged | ((delta_norm <= 1.0) & ~invalid)
+                            failed_new = failed | invalid
+                            return (u_new, converged_new, failed_new, it + 1)
+
+                        init = (
+                            predictor,
+                            jnp.zeros((bs,), dtype=jnp.bool_),
+                            jnp.zeros((bs,), dtype=jnp.bool_),
+                            jnp.int32(0),
+                        )
+                        u_final, converged, failed, _ = jax.lax.while_loop(
+                            cond_fn, body_fn, init
+                        )
+                        fi_final = _implicit_batched(u_final, t_stage, params_batch)
+                        failed = failed | ~converged | jnp.any(
+                            ~jnp.isfinite(fi_final), axis=1
+                        )
+                        return u_final, fi_final, failed
+
+                    return jax.lax.cond(
+                        jnp.any(mask), newton_fn, direct_fn, None
                     )
-                    u_final, converged, failed, _ = jax.lax.while_loop(
-                        cond_fn, body_fn, init
-                    )
-                    fi_final = _implicit_batched(u_final, t_stage, params_batch)
-                    failed = failed | ~converged | jnp.any(
-                        ~jnp.isfinite(fi_final), axis=1
-                    )
-                    return u_final, fi_final, failed
 
             def _step_batch(y, t, dt):
                 dt_col = dt[:, None]
