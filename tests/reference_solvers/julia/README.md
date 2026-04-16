@@ -2,7 +2,9 @@
 
 This folder contains Julia-based reference solvers that the Python tests call through
 `run_solver.jl`. The Julia code uses `DiffEqGPU.jl` so the reference trajectories are
-computed on the GPU rather than by a CPU fallback.
+computed on the GPU rather than by a CPU fallback. The docs for Julia's DiffEqGPU.jl 
+package are here: https://docs.sciml.ai/DiffEqGPU/stable/ and the code can be found 
+here: https://github.com/SciML/DiffEqGPU.jl.
 
 ## Backends
 

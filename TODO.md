@@ -1,14 +1,3 @@
-
------
-
-Add the following Julia based reference solvers to tests/reference_solvers/julia: Tsit5,  KenCarp5, Rodas5 and Kvaerno5. Use the DiffEqGPU.jl package to ensure the Julia ODE solvers run on the GPU. We want to be able to call the Julia based reference solvers from Python tests of the form test_julia_tsit5, so create an entry point Julia script that the Python test can execute, passing it the name of the test ODE system (which will have to reimplemented in Julia alongside the solvers in tests/reference_solvers/julia), test parameters like ensemble size and system dimensions, along with all the args that usually get passed to the python solvers, like the batch of parameters and initial conditions, and output times. Separate the definition of the ODE system in Julia from the code used to invoke the solver, since multiple different Julia solvers will be tested on the same ODE system. The script should return its outputs to Python for the usual consistency checks (though not any correctness/accuracy checks that are not analytically exact and therefore require a separate reference solver). Parameterise the tests on the usual ensemble size, dimensionality, and also on whether to run the ODE with EnsembleGPUArray or EnsembleGPUKernel. In a README.md in the tests/reference_solvers/julia folder explain the difference between EnsembleGPUArray and EnsembleGPUKernel. The docs for Julia's DiffEqGPU.jl package are here: https://docs.sciml.ai/DiffEqGPU/stable/ and the code can be found here: https://github.com/SciML/DiffEqGPU.jl. There is no need to create a make_cached_solver because we will not be using this reference solver to assert the correctness of existing test results. Create new tests for all the Julia reference solvers for all the test ODE systems. For the Julia kencarp5 solver this should run with the same IMEX splits that our own version of kencarp5 runs with.
-
------
-
-Shouldn't rodas5.py's stages evaluate ode_fn at different times? The current code is only correct for autonomous ODE systems right? Fix this and check whether this issue exists in any of the other ODE solvers, then fix them too.
-
------
-
 Implement a new IMEX solver named kencarpgersh5.py that is a dynamic version of kencarp5 but instead of taking a split ode or jacobian function, it takes a single ode or jacobian, and at every step in the loop of the solver splits the resulting jacobian into stiff and non-stiff parts using Gershgorin's circle theorem and subsequent reodering of the jacobian matrix. Please write a docstring as part of the solver files that describes the method in detail, what it aims to do and in what situations it is better than the ordinary kencarp5.py method.
 
 Here is an overview of the idea:
@@ -113,22 +102,3 @@ This matrix is **square**, it's much smaller than the original $M$, and it repre
 ## 3. When does this benefit disappear?
 
 The only time this "trimming" strategy fails is if your **stiff variables are coupled to every other variable.** If every row has at least one "fast" interaction, you can't zero out any rows. But in physical systems (like a power grid or a large chemical network), stiffness is often localized to a small subset of "fast" components. In those cases, the size of the matrix you actually need to factorize might be only 10% or 20% of the total system size.
-
------
-
-Some info:
-
-**[test_reversible_trapping.py](vscode-webview://111ju7d7ot3l2i80tg802elhjuhmqnjafhjedh9dnf3j07to9b0h/tests/linear/test_reversible_trapping.py)** is the closest structural match.
-
-Einstein-Boltzmann linearized CMB has four defining features: (1) linear stiff, (2) block-coupled fast/slow subsystems — Thomson scattering tightly couples photons↔baryons on a much faster timescale than gravitational evolution, (3) spatial/mode transport, (4) mass/energy conservation. Reversible trapping hits all four: a mobile species with Laplacian diffusion (slow transport, like metric/acoustic evolution) coupled to an immobile species via fast `k_on`/`k_off` exchange (tight-coupling analog), with stiffness ~1e4 from the scale separation and exact conservation.
-
-Secondary matches:
-
-- **[test_nn_reactions.py](vscode-webview://111ju7d7ot3l2i80tg802elhjuhmqnjafhjedh9dnf3j07to9b0h/tests/linear/test_nn_reactions.py)** — tridiagonal linear structure resembles the photon multipole hierarchy's ℓ↔ℓ±1 coupling, and its ~1e8 stiffness mimics the Thomson rate, but it lacks the fast/slow block separation.
-- **[test_bateman.py](vscode-webview://111ju7d7ot3l2i80tg802elhjuhmqnjafhjedh9dnf3j07to9b0h/tests/linear/test_bateman.py)** — linear stiff with controllable ratio, but the pure unidirectional decay misses the back-reaction coupling that defines the E-B system.
-
-None of the tests capture the oscillatory acoustic character; if that matters for your solver validation, reversible trapping + a damped-rotation-style oscillatory test together would cover more of the CMB system's behaviour than any single test alone.
-
----
-
-Run the test_reversible_trapping ODE system with dimensions 70D and ensemble size 1k, varying the solver, linear vs nonlinear paths, and 32 bit vs 64 bit precision. Each timing should be done sequentially to avoid saturating the GPU. If a given solver+params takes more than 10s, abort that test and simply record it as >10s. Plot the resulting timings in a bar chart with solver+params on the x axis, and time to compute 1k ODEs on the y axis. The x axis should be ordered in terms of decreasing time.
