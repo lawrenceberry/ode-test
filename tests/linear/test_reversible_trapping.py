@@ -335,6 +335,48 @@ def test_kencarpgersh5(
         )
 
 
+@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
+def test_kencarpgersh5_linearise_matches_reference(lu_precision):
+    """Stage-local stiff-linearisation mode stays close to the cached reference."""
+    system = _make_reversible_trapping_system(_SYSTEM_DIMS[0])
+    params = _make_params_batch(_REFERENCE_ENSEMBLE_SIZES[0], seed=42)
+    solve = make_kencarpgersh5(
+        ode_fn=system["ode_fn"],
+        lu_precision=lu_precision,
+        linearise=True,
+    )
+    results = solve(
+        y0=system["y0"],
+        t_span=_TIMES,
+        params=params,
+        first_step=1e-6,
+        rtol=1e-6,
+        atol=1e-8,
+    ).block_until_ready()
+    results_np = np.asarray(results)
+
+    assert results.shape == (
+        _REFERENCE_ENSEMBLE_SIZES[0],
+        len(_TIMES),
+        system["n_vars"],
+    )
+    assert np.all(np.isfinite(results_np))
+    np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=_GERSH_MASS_ATOL)
+
+    solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
+    y_ref = solve_ref(
+        y0=system["y0"],
+        t_span=_TIMES,
+        params=params,
+        first_step=1e-6,
+        rtol=1e-8,
+        atol=1e-10,
+    ).block_until_ready()
+    np.testing.assert_allclose(
+        results_np, np.asarray(y_ref), rtol=_GERSH_REF_RTOL, atol=1e-7
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reference solver timings
 # ---------------------------------------------------------------------------

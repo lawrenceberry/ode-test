@@ -242,6 +242,7 @@ def test_kencarpgersh5(benchmark, ensemble_size, lu_precision):
     solve = make_kencarpgersh5(
         ode_fn=system["ode_fn"],
         lu_precision=lu_precision,
+        linearise=True,
     )
     results = benchmark.pedantic(
         lambda: solve(

@@ -23,7 +23,10 @@ every time step.  This is particularly advantageous when:
 
 The trade-off is a single full-Jacobian evaluation per time step (versus zero
 for ``kencarp5`` when the implicit part is zero), which is amortised over the
-eight KenCarp5 stages and the Newton iterations within each stage.
+eight KenCarp5 stages and the Newton iterations within each stage.  When
+``linearise=True``, the stiff Jacobian is re-evaluated at each stage and used
+as a stage-local linearisation, avoiding Newton iterations for the implicit
+stage solve.
 
 ## The Gershgorin Circle Theorem and the partition algorithm
 
@@ -73,6 +76,10 @@ scales as |S|³ instead of n³.
 
 * Within each implicit stage a standard Newton loop is run.  For non-stiff rows the
   Newton step reduces to direct substitution (one pass, no LU required).
+* With ``linearise=True``, the Gershgorin-selected stiff Jacobian is
+  re-evaluated at each stage and defines ``f_impl(y) = J_stiff y`` and
+  ``f_expl(y) = f(y) - J_stiff y`` for that stage.  This reuses the same
+  single-LU stage path as ``linear=True``.
 * The ``gershgorin_tau`` parameter can be tuned: a larger value makes the
   non-stiff set larger (faster, less conservative); a smaller value routes
   more rows to the implicit solver (slower, more stable).
@@ -241,6 +248,7 @@ def make_solver(
     ode_fn,
     lu_precision: Literal["fp32", "fp64"] = "fp64",
     linear: bool = False,
+    linearise: bool = False,
     gershgorin_tau: float = 1000.0,
     batch_size=None,
 ):
@@ -258,6 +266,12 @@ def make_solver(
     linear:
         If True, the ODE is is assumbed to be linear in y so that Newton's
         method converges in one iteration.
+    linearise:
+        If True, re-evaluate the Gershgorin-selected stiff Jacobian at each
+        stage and define ``f_impl(y) = J_stiff y`` and
+        ``f_expl(y) = f(y) - J_stiff y`` for that stage.  This uses the same
+        single-LU stage solve as ``linear=True`` without assuming that the
+        full ODE is linear.
     gershgorin_tau:
         Stability speed limit multiplier.  A row *i* of the Jacobian is
         classified as **stiff** when its Gershgorin upper bound satisfies
@@ -310,34 +324,63 @@ def make_solver(
 
             if linear:
 
-                def _newton_stage(
+                def _solve_stage(
                     base,
                     t_stage,
                     dt,
                     predictor,
-                    _implicit_batched,
+                    _split_batched_fn,
                     _implicit_jac_batched,
                 ):
                     gamma_dt = dt * _GAMMA
                     jac = _implicit_jac_batched(predictor, t_stage, params_batch)
                     mask = jnp.any(jac != 0.0, axis=2)
                     u_stage = solve_row_masked(jac, base, mask, gamma_dt)
-                    fi_stage = _implicit_batched(u_stage, t_stage, params_batch)
+                    fe_stage, fi_stage = _split_batched_fn(
+                        u_stage, t_stage, params_batch
+                    )
                     failed = (
                         jnp.any(~jnp.isfinite(jac), axis=(1, 2))
                         | jnp.any(~jnp.isfinite(u_stage), axis=1)
+                        | jnp.any(~jnp.isfinite(fe_stage), axis=1)
                         | jnp.any(~jnp.isfinite(fi_stage), axis=1)
                     )
-                    return u_stage, fi_stage, failed
+                    return u_stage, fe_stage, fi_stage, failed
 
-            else:
+            elif linearise:
 
-                def _newton_stage(
+                def _solve_stage(
                     base,
                     t_stage,
                     dt,
                     predictor,
-                    _implicit_batched,
+                    _split_batched_fn,
+                    _implicit_jac_batched,
+                ):
+                    del _split_batched_fn
+                    gamma_dt = dt * _GAMMA
+                    jac = _implicit_jac_batched(predictor, t_stage, params_batch)
+                    mask = jnp.any(jac != 0.0, axis=2)
+                    u_stage = solve_row_masked(jac, base, mask, gamma_dt)
+                    fi_stage = jnp.einsum("bij,bj->bi", jac, u_stage)
+                    f_full = _ode_batched(u_stage, t_stage, params_batch)
+                    fe_stage = f_full - fi_stage
+                    failed = (
+                        jnp.any(~jnp.isfinite(jac), axis=(1, 2))
+                        | jnp.any(~jnp.isfinite(u_stage), axis=1)
+                        | jnp.any(~jnp.isfinite(fe_stage), axis=1)
+                        | jnp.any(~jnp.isfinite(fi_stage), axis=1)
+                    )
+                    return u_stage, fe_stage, fi_stage, failed
+
+            else:
+
+                def _solve_stage(
+                    base,
+                    t_stage,
+                    dt,
+                    predictor,
+                    _split_batched_fn,
                     _implicit_jac_batched,
                 ):
                     gamma_dt = dt * _GAMMA
@@ -351,9 +394,9 @@ def make_solver(
 
                     def direct_fn(_):
                         # All rows inactive: one f_impl eval, no LU, no loop.
-                        fi = _implicit_batched(predictor, t_stage, params_batch)
+                        fe, fi = _split_batched_fn(predictor, t_stage, params_batch)
                         u = base + gamma_dt[:, None] * fi
-                        return u, fi, jnp.zeros((bs,), jnp.bool_)
+                        return u, fe, fi, jnp.zeros((bs,), jnp.bool_)
 
                     def newton_fn(_):
                         def cond_fn(state):
@@ -364,7 +407,7 @@ def make_solver(
 
                         def body_fn(state):
                             u, converged, failed, it = state
-                            fi = _implicit_batched(u, t_stage, params_batch)
+                            _, fi = _split_batched_fn(u, t_stage, params_batch)
                             res = u - base - gamma_dt[:, None] * fi
                             jac = _implicit_jac_batched(u, t_stage, params_batch)
                             # Reduced solve: inactive rows → delta_i = res_i (direct),
@@ -399,13 +442,16 @@ def make_solver(
                         u_final, converged, failed, _ = jax.lax.while_loop(
                             cond_fn, body_fn, init
                         )
-                        fi_final = _implicit_batched(u_final, t_stage, params_batch)
+                        fe_final, fi_final = _split_batched_fn(
+                            u_final, t_stage, params_batch
+                        )
                         failed = (
                             failed
                             | ~converged
+                            | jnp.any(~jnp.isfinite(fe_final), axis=1)
                             | jnp.any(~jnp.isfinite(fi_final), axis=1)
                         )
-                        return u_final, fi_final, failed
+                        return u_final, fe_final, fi_final, failed
 
                     return jax.lax.cond(jnp.any(mask), newton_fn, direct_fn, None)
 
@@ -432,15 +478,16 @@ def make_solver(
                         stiff_mask[:, :, None], _jac_batched(y, t, params_batch), 0.0
                     )  # (bs, n, n)
 
-                def _implicit_batched(u, t, params_batch):
-                    # Evaluate the implicit part of the ODE by masking the full ODE.
-                    f_full = _ode_batched(u, t, params_batch)  # (bs, n)
-                    return jnp.where(stiff_mask, f_full, 0.0)
+                def _split_batched(u, t, params_batch):
+                    if linearise:
+                        jac = _implicit_jac_batched(u, t, params_batch)
+                        fi = jnp.einsum("bij,bj->bi", jac, u)
+                        f_full = _ode_batched(u, t, params_batch)  # (bs, n)
+                        return f_full - fi, fi
 
-                def _explicit_batched(u, t, params_batch):
-                    # Evaluate the explicit part of the ODE by masking the full ODE.
                     f_full = _ode_batched(u, t, params_batch)  # (bs, n)
-                    return jnp.where(stiff_mask, 0.0, f_full)
+                    fi = jnp.where(stiff_mask, f_full, 0.0)
+                    return f_full - fi, fi
 
                 # ------------------------------------------------------------------
                 # KenCarp5 stages
@@ -452,8 +499,7 @@ def make_solver(
 
                 y_stage = y
                 t_stage = t
-                fe_stage = _explicit_batched(y_stage, t_stage, params_batch)
-                fi_stage = _implicit_batched(y_stage, t_stage, params_batch)
+                fe_stage, fi_stage = _split_batched(y_stage, t_stage, params_batch)
                 stage_y.append(y_stage)
                 stage_fe.append(fe_stage)
                 stage_fi.append(fi_stage)
@@ -480,15 +526,14 @@ def make_solver(
                         if coeff != 0.0:
                             predictor = predictor + coeff * stage_y[j]
 
-                    y_stage, fi_stage, stage_failed = _newton_stage(
+                    y_stage, fe_stage, fi_stage, stage_failed = _solve_stage(
                         base,
                         t_stage,
                         dt,
                         predictor,
-                        _implicit_batched,
+                        _split_batched,
                         _implicit_jac_batched,
                     )
-                    fe_stage = _explicit_batched(y_stage, t_stage, params_batch)
                     failed = (
                         failed
                         | stage_failed
