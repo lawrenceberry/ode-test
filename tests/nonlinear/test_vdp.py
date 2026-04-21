@@ -4,8 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.kencarp5 import make_solver as make_kencarp5
-from solvers.rodas5 import make_solver as make_rodas5
+from solvers.kencarp5 import solve as kencarp5_solve
+from solvers.rodas5 import solve as rodas5_solve
 from tests.reference_solvers.python.diffrax_kencarp5 import (
     make_solver as make_diffrax_kencarp5_solver,
 )
@@ -139,6 +139,11 @@ def _run_julia_vdp(
     )
 
 
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize(
     "vdp_system",
     [(n, m) for n in _OSC_PAIRS for m in _MU_SCALES],
@@ -151,12 +156,13 @@ def test_rodas5(benchmark, vdp_system, ensemble_size, lu_precision):
     """Rodas5 nonlinear benchmark with cached Diffrax validation on practical ensemble sizes."""
     system = vdp_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_rodas5(ode_fn=system["ode_fn"], lu_precision=lu_precision)
     results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
+        lambda: rodas5_solve(
+            system["ode_fn"],
+            system["y0"],
+            _TIMES,
+            params,
+            lu_precision=lu_precision,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -194,60 +200,14 @@ def test_kencarp5(benchmark, vdp_system, ensemble_size, lu_precision):
     """KenCarp5 nonlinear benchmark with cached Diffrax validation on practical ensemble sizes."""
     system = vdp_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kencarp5(
-        explicit_ode_fn=system["explicit_ode_fn"],
-        implicit_ode_fn=system["implicit_ode_fn"],
-        lu_precision=lu_precision,
-    )
     results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
-            first_step=1e-6,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-    results_np = np.asarray(results)
-
-    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(results_np))
-
-    if ensemble_size in _REFERENCE_ENSEMBLE_SIZES:
-        solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
-        y_ref = solve_ref(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
-            first_step=1e-6,
-            rtol=1e-8,
-            atol=1e-10,
-        ).block_until_ready()
-        np.testing.assert_allclose(results_np, np.asarray(y_ref), rtol=5e-4, atol=3e-8)
-
-
-@pytest.mark.parametrize(
-    "vdp_system",
-    [(n, m) for n in _OSC_PAIRS for m in _MU_SCALES],
-    indirect=True,
-    ids=lambda p: f"{p[0]}osc-mu{p[1]}",
-)
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_diffrax_kencarp5(benchmark, vdp_system, ensemble_size):
-    """Diffrax KenCarp5 benchmark with cached Diffrax validation on practical ensemble sizes."""
-    system = vdp_system
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_kencarp5_solver(
-        system["explicit_ode_fn"], system["implicit_ode_fn"]
-    )
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_TIMES,
-            params=params,
+        lambda: kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
+            system["y0"],
+            _TIMES,
+            params,
+            lu_precision=lu_precision,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -320,23 +280,42 @@ def test_diffrax_kvaerno5(benchmark, vdp_system, ensemble_size):
     indirect=True,
     ids=lambda p: f"{p[0]}osc-mu{p[1]}",
 )
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_kencarp5(benchmark, vdp_system, ensemble_size, ensemble_backend):
-    """Julia KenCarp5 benchmark on coupled van der Pol oscillators."""
-    system, results_np = _run_julia_vdp(
-        benchmark,
-        make_julia_kencarp5_solver,
-        vdp_system,
-        ensemble_size,
-        ensemble_backend,
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+def test_diffrax_kencarp5(benchmark, vdp_system, ensemble_size):
+    """Diffrax KenCarp5 benchmark with cached Diffrax validation on practical ensemble sizes."""
+    system = vdp_system
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_diffrax_kencarp5_solver(
+        system["explicit_ode_fn"], system["implicit_ode_fn"]
     )
-    assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-6,
+            rtol=1e-6,
+            atol=1e-8,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+    results_np = np.asarray(results)
+
+    assert results.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     assert np.all(np.isfinite(results_np))
+
+    if ensemble_size in _REFERENCE_ENSEMBLE_SIZES:
+        solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
+        y_ref = solve_ref(
+            y0=system["y0"],
+            t_span=_TIMES,
+            params=params,
+            first_step=1e-6,
+            rtol=1e-8,
+            atol=1e-10,
+        ).block_until_ready()
+        np.testing.assert_allclose(results_np, np.asarray(y_ref), rtol=5e-4, atol=3e-8)
 
 
 @pytest.mark.parametrize(
@@ -372,11 +351,11 @@ def test_julia_rodas5(benchmark, vdp_system, ensemble_size, ensemble_backend):
 @pytest.mark.parametrize(
     "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
 )
-def test_julia_kvaerno5(benchmark, vdp_system, ensemble_size, ensemble_backend):
-    """Julia Kvaerno5 benchmark on coupled van der Pol oscillators."""
+def test_julia_kencarp5(benchmark, vdp_system, ensemble_size, ensemble_backend):
+    """Julia KenCarp5 benchmark on coupled van der Pol oscillators."""
     system, results_np = _run_julia_vdp(
         benchmark,
-        make_julia_kvaerno5_solver,
+        make_julia_kencarp5_solver,
         vdp_system,
         ensemble_size,
         ensemble_backend,
