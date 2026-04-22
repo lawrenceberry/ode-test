@@ -31,13 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.kencarp5 import solve as kencarp5_solve
-from solvers.kencarpgersh5 import make_solver as make_kencarpgersh5
 from solvers.rodas5 import solve as rodas5_solve
 from solvers.tsit5 import solve as tsit5_solve
-from tests.reference_solvers.python.diffrax_kencarp5 import (
-    make_solver as make_diffrax_kencarp5_solver,
-)
 from tests.reference_solvers.python.diffrax_kvaerno5 import (
     make_solver as make_kvaerno5_solver,
 )
@@ -48,13 +43,6 @@ from tests.reference_solvers.python.julia_common import (
     JULIA_ENSEMBLE_BACKENDS,
     benchmark_julia_solver,
     julia_backend_id,
-    maybe_mark_large_ensemble_sizes,
-)
-from tests.reference_solvers.python.julia_kencarp5 import (
-    make_solver as make_julia_kencarp5_solver,
-)
-from tests.reference_solvers.python.julia_kvaerno5 import (
-    make_solver as make_julia_kvaerno5_solver,
 )
 from tests.reference_solvers.python.julia_rodas5 import (
     make_solver as make_julia_rodas5_solver,
@@ -156,32 +144,6 @@ def _run_julia_lorenz(benchmark, solver_factory, ensemble_size, ensemble_backend
 
 
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
-def test_rodas5(benchmark, ensemble_size, lu_precision):
-    """Rodas5 nonlinear ensemble benchmark on the Lorenz system."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-    results = benchmark.pedantic(
-        lambda: rodas5_solve(
-            system["ode_fn"],
-            y0=system["y0"],
-            t_span=_T_SPAN,
-            params=params,
-            lu_precision=lu_precision,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
-    assert np.all(np.isfinite(results))
-    _assert_on_attractor(np.asarray(results[:, -1, :]))
-
-
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
 def test_tsit5(benchmark, ensemble_size):
     """Tsit5 nonlinear ensemble benchmark on the Lorenz system."""
     system = _make_lorenz_system()
@@ -207,14 +169,13 @@ def test_tsit5(benchmark, ensemble_size):
 
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
 @pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
-def test_kencarp5(benchmark, ensemble_size, lu_precision):
-    """KenCarp5 nonlinear ensemble benchmark on the Lorenz system."""
+def test_rodas5(benchmark, ensemble_size, lu_precision):
+    """Rodas5 nonlinear ensemble benchmark on the Lorenz system."""
     system = _make_lorenz_system()
     params = _make_params_batch(ensemble_size, seed=42)
     results = benchmark.pedantic(
-        lambda: kencarp5_solve(
-            system["explicit_ode_fn"],
-            system["implicit_ode_fn"],
+        lambda: rodas5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_T_SPAN,
             params=params,
@@ -232,60 +193,9 @@ def test_kencarp5(benchmark, ensemble_size, lu_precision):
     _assert_on_attractor(np.asarray(results[:, -1, :]))
 
 
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-@pytest.mark.parametrize("lu_precision", ["fp32", "fp64"])
-def test_kencarpgersh5(benchmark, ensemble_size, lu_precision):
-    """KenCarp5 nonlinear ensemble benchmark on the Lorenz system."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kencarpgersh5(
-        ode_fn=system["ode_fn"],
-        lu_precision=lu_precision,
-        linearise=True,
-    )
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=_T_SPAN,
-            params=params,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
-    assert np.all(np.isfinite(results))
-    _assert_on_attractor(np.asarray(results[:, -1, :]))
-
-
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_diffrax_kencarp5(benchmark, ensemble_size):
-    """Diffrax KenCarp5 benchmark with attractor-confinement validation."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_kencarp5_solver(
-        system["explicit_ode_fn"], system["implicit_ode_fn"]
-    )
-    t_span = jnp.array(list(_T_SPAN), dtype=jnp.float64)
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=t_span,
-            params=params,
-            first_step=1e-4,
-            rtol=1e-6,
-            atol=1e-8,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
-    assert np.all(np.isfinite(results))
-    _assert_on_attractor(np.asarray(results[:, -1, :]))
+# ---------------------------------------------------------------------------
+# Reference solver timings
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
@@ -313,9 +223,84 @@ def test_diffrax_tsit5(benchmark, ensemble_size):
     _assert_on_attractor(np.asarray(results[:, -1, :]))
 
 
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+def test_diffrax_kvaerno5(benchmark, ensemble_size):
+    """Diffrax Kvaerno5 benchmark with attractor-confinement validation."""
+    system = _make_lorenz_system()
+    params = _make_params_batch(ensemble_size, seed=42)
+    solve = make_kvaerno5_solver(system["ode_fn"])
+    t_span = jnp.array(list(_T_SPAN), dtype=jnp.float64)
+    results = benchmark.pedantic(
+        lambda: solve(
+            y0=system["y0"],
+            t_span=t_span,
+            params=params,
+            first_step=1e-4,
+            rtol=1e-8,
+            atol=1e-10,
+        ).block_until_ready(),
+        warmup_rounds=1,
+        rounds=1,
+    )
+
+    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
+    assert np.all(np.isfinite(results))
+    _assert_on_attractor(np.asarray(results[:, -1, :]))
+
+
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+@pytest.mark.parametrize(
+    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
+)
+def test_julia_tsit5(benchmark, ensemble_size, ensemble_backend):
+    """Julia Tsit5 benchmark with attractor-confinement validation."""
+    results_np = _run_julia_lorenz(
+        benchmark, make_julia_tsit5_solver, ensemble_size, ensemble_backend
+    )
+    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
+    assert np.all(np.isfinite(results_np))
+    _assert_on_attractor(results_np[:, -1, :])
+
+
+@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
+@pytest.mark.parametrize(
+    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
+)
+def test_julia_rodas5(benchmark, ensemble_size, ensemble_backend):
+    """Julia Rodas5 benchmark with attractor-confinement validation."""
+    results_np = _run_julia_lorenz(
+        benchmark, make_julia_rodas5_solver, ensemble_size, ensemble_backend
+    )
+    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
+    assert np.all(np.isfinite(results_np))
+    _assert_on_attractor(results_np[:, -1, :])
+
+
 # ---------------------------------------------------------------------------
 # Attractor confinement — long integration
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ensemble_size", [2])
+def test_tsit5_stays_on_attractor(ensemble_size):
+    """Verify Tsit5 trajectories remain on the attractor manifold over t ∈ [0, 20]."""
+    system = _make_lorenz_system()
+    params = _make_params_batch(ensemble_size, seed=42)
+
+    y = tsit5_solve(
+        system["ode_fn"],
+        y0=system["y0"],
+        t_span=_ATTRACTOR_TIMES,
+        params=params,
+        first_step=1e-4,
+        rtol=1e-8,
+        atol=1e-10,
+    ).block_until_ready()
+
+    assert y.shape == (ensemble_size, len(_ATTRACTOR_TIMES), system["n_vars"])
+    assert np.all(np.isfinite(y))
+    for t_idx in range(len(_ATTRACTOR_TIMES)):
+        _assert_on_attractor(np.asarray(y[:, t_idx, :]))
 
 
 @pytest.mark.parametrize("ensemble_size", [2])
@@ -345,144 +330,3 @@ def test_rodas5_stays_on_attractor(ensemble_size, lu_precision):
     assert np.all(np.isfinite(y))
     for t_idx in range(len(_ATTRACTOR_TIMES)):
         _assert_on_attractor(np.asarray(y[:, t_idx, :]))
-
-
-@pytest.mark.parametrize("ensemble_size", [2])
-def test_tsit5_stays_on_attractor(ensemble_size):
-    """Verify Tsit5 trajectories remain on the attractor manifold over t ∈ [0, 20]."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-
-    y = tsit5_solve(
-        system["ode_fn"],
-        y0=system["y0"],
-        t_span=_ATTRACTOR_TIMES,
-        params=params,
-        first_step=1e-4,
-        rtol=1e-8,
-        atol=1e-10,
-    ).block_until_ready()
-
-    assert y.shape == (ensemble_size, len(_ATTRACTOR_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(y))
-    for t_idx in range(len(_ATTRACTOR_TIMES)):
-        _assert_on_attractor(np.asarray(y[:, t_idx, :]))
-
-
-@pytest.mark.parametrize("ensemble_size", [2])
-@pytest.mark.parametrize("lu_precision", ["fp64"])
-def test_kencarp5_stays_on_attractor(ensemble_size, lu_precision):
-    """Verify KenCarp5 trajectories remain on the attractor manifold over t ∈ [0, 20]."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-
-    y = kencarp5_solve(
-        system["explicit_ode_fn"],
-        system["implicit_ode_fn"],
-        y0=system["y0"],
-        t_span=_ATTRACTOR_TIMES,
-        params=params,
-        lu_precision=lu_precision,
-        first_step=1e-4,
-        rtol=1e-8,
-        atol=1e-10,
-    ).block_until_ready()
-
-    assert y.shape == (ensemble_size, len(_ATTRACTOR_TIMES), system["n_vars"])
-    assert np.all(np.isfinite(y))
-    for t_idx in range(len(_ATTRACTOR_TIMES)):
-        _assert_on_attractor(np.asarray(y[:, t_idx, :]))
-
-
-# ---------------------------------------------------------------------------
-# Reference solver timings
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("ensemble_size", _ENSEMBLE_SIZES)
-def test_diffrax_kvaerno5(benchmark, ensemble_size):
-    """Diffrax Kvaerno5 benchmark with attractor-confinement validation."""
-    system = _make_lorenz_system()
-    params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kvaerno5_solver(system["ode_fn"])
-    t_span = jnp.array(list(_T_SPAN), dtype=jnp.float64)
-    results = benchmark.pedantic(
-        lambda: solve(
-            y0=system["y0"],
-            t_span=t_span,
-            params=params,
-            first_step=1e-4,
-            rtol=1e-8,
-            atol=1e-10,
-        ).block_until_ready(),
-        warmup_rounds=1,
-        rounds=1,
-    )
-
-    assert results.shape == (ensemble_size, len(_T_SPAN), system["n_vars"])
-    assert np.all(np.isfinite(results))
-    _assert_on_attractor(np.asarray(results[:, -1, :]))
-
-
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_tsit5(benchmark, ensemble_size, ensemble_backend):
-    """Julia Tsit5 benchmark with attractor-confinement validation."""
-    results_np = _run_julia_lorenz(
-        benchmark, make_julia_tsit5_solver, ensemble_size, ensemble_backend
-    )
-    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
-    assert np.all(np.isfinite(results_np))
-    _assert_on_attractor(results_np[:, -1, :])
-
-
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_kencarp5(benchmark, ensemble_size, ensemble_backend):
-    """Julia KenCarp5 benchmark with attractor-confinement validation."""
-    results_np = _run_julia_lorenz(
-        benchmark, make_julia_kencarp5_solver, ensemble_size, ensemble_backend
-    )
-    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
-    assert np.all(np.isfinite(results_np))
-    _assert_on_attractor(results_np[:, -1, :])
-
-
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_rodas5(benchmark, ensemble_size, ensemble_backend):
-    """Julia Rodas5 benchmark with attractor-confinement validation."""
-    results_np = _run_julia_lorenz(
-        benchmark, make_julia_rodas5_solver, ensemble_size, ensemble_backend
-    )
-    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
-    assert np.all(np.isfinite(results_np))
-    _assert_on_attractor(results_np[:, -1, :])
-
-
-@pytest.mark.parametrize(
-    "ensemble_size", maybe_mark_large_ensemble_sizes(_ENSEMBLE_SIZES)
-)
-@pytest.mark.parametrize(
-    "ensemble_backend", JULIA_ENSEMBLE_BACKENDS, ids=julia_backend_id
-)
-def test_julia_kvaerno5(benchmark, ensemble_size, ensemble_backend):
-    """Julia Kvaerno5 benchmark with attractor-confinement validation."""
-    results_np = _run_julia_lorenz(
-        benchmark, make_julia_kvaerno5_solver, ensemble_size, ensemble_backend
-    )
-    assert results_np.shape == (ensemble_size, len(_T_SPAN), 3)
-    assert np.all(np.isfinite(results_np))
-    _assert_on_attractor(results_np[:, -1, :])
