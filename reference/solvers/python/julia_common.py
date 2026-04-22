@@ -54,13 +54,13 @@ def maybe_mark_large_ensemble_sizes(sizes):
     ]
 
 
-def benchmark_julia_solver(benchmark, solve, **solve_kwargs):
+def benchmark_julia_solver(benchmark, solve, *solve_args, **solve_kwargs):
     """Record Julia solve-only timing in pytest-benchmark and return NumPy output."""
     solve_with_timing = getattr(solve, "_julia_solve_with_timing", None)
     if solve_with_timing is None:
         raise TypeError(
-            "benchmark_julia_solver requires a Julia solver created by "
-            "reference.solvers.python.julia_common.make_solver"
+            "benchmark_julia_solver requires a Julia direct solve function with "
+            "a _julia_solve_with_timing attribute"
         )
 
     if benchmark._mode:
@@ -70,9 +70,9 @@ def benchmark_julia_solver(benchmark, solve, **solve_kwargs):
     try:
         benchmark._mode = "benchmark.julia_solver(...)"
         if benchmark.disabled:
-            return np.asarray(solve(**solve_kwargs))
+            return np.asarray(solve(*solve_args, **solve_kwargs))
 
-        result = solve_with_timing(**solve_kwargs)
+        result = solve_with_timing(*solve_args, **solve_kwargs)
         stats = benchmark._make_stats(1)
         stats.update(result.solve_time_s)
         benchmark.extra_info["julia_solve_time_s"] = result.solve_time_s
@@ -84,14 +84,21 @@ def benchmark_julia_solver(benchmark, solve, **solve_kwargs):
         raise
 
 
-def make_solver(
+def solve_with_timing(
     solver_name: str,
     system_name: str,
+    y0,
+    t_span,
+    params,
     *,
     system_config: dict | None = None,
     ensemble_backend: str = "EnsembleGPUArray",
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
 ):
-    """Create a Julia subprocess solver with the usual Python test signature."""
+    """Run a Julia reference solver and return output plus timing metadata."""
     system_config_dict = {} if system_config is None else dict(system_config)
     require_julia_reference_support(
         solver_name,
@@ -99,59 +106,52 @@ def make_solver(
         system_name=system_name,
         system_config=system_config_dict,
     )
-
-    def _solve(
+    return _run_julia_solver(
+        solver_name,
+        system_name,
+        ensemble_backend,
+        system_config_dict,
         y0,
         t_span,
         params,
-        *,
-        rtol=1e-8,
-        atol=1e-10,
-        first_step=None,
-        max_steps=100000,
-    ):
-        result = _run_julia_solver(
-            solver_name,
-            system_name,
-            ensemble_backend,
-            system_config_dict,
-            y0,
-            t_span,
-            params,
-            rtol=rtol,
-            atol=atol,
-            first_step=first_step,
-            max_steps=max_steps,
-        )
-        return result.ys
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+    )
 
-    def _solve_with_timing(
+
+def solve(
+    solver_name: str,
+    system_name: str,
+    y0,
+    t_span,
+    params,
+    *,
+    system_config: dict | None = None,
+    ensemble_backend: str = "EnsembleGPUArray",
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
+):
+    """Run a Julia reference solver and return the ensemble solution."""
+    return solve_with_timing(
+        solver_name,
+        system_name,
         y0,
         t_span,
         params,
-        *,
-        rtol=1e-8,
-        atol=1e-10,
-        first_step=None,
-        max_steps=100000,
-    ):
-        return _run_julia_solver(
-            solver_name,
-            system_name,
-            ensemble_backend,
-            system_config_dict,
-            y0,
-            t_span,
-            params,
-            rtol=rtol,
-            atol=atol,
-            first_step=first_step,
-            max_steps=max_steps,
-        )
+        system_config=system_config,
+        ensemble_backend=ensemble_backend,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+    ).ys
 
-    _solve._julia_solve_with_timing = _solve_with_timing
 
-    return _solve
+solve._julia_solve_with_timing = solve_with_timing
 
 
 def require_julia_reference_support(

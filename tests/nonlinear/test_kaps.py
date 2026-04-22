@@ -18,29 +18,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.kencarp5 import make_solver as make_kencarp5
-from solvers.rodas5 import make_solver as make_rodas5
-from reference.solvers.python.diffrax_kencarp5 import (
-    make_solver as make_diffrax_kencarp5_solver,
-)
-from reference.solvers.python.diffrax_kvaerno5 import (
-    make_solver as make_kvaerno5_solver,
-)
+from reference.solvers.python.diffrax_kencarp5 import solve as diffrax_kencarp5_solve
+from reference.solvers.python.diffrax_kvaerno5 import solve as diffrax_kvaerno5_solve
 from reference.solvers.python.julia_common import (
     JULIA_ENSEMBLE_BACKENDS,
     benchmark_julia_solver,
     julia_backend_id,
     maybe_mark_large_ensemble_sizes,
 )
-from reference.solvers.python.julia_kencarp5 import (
-    make_solver as make_julia_kencarp5_solver,
-)
-from reference.solvers.python.julia_kvaerno5 import (
-    make_solver as make_julia_kvaerno5_solver,
-)
-from reference.solvers.python.julia_rodas5 import (
-    make_solver as make_julia_rodas5_solver,
-)
+from reference.solvers.python.julia_kencarp5 import solve as julia_kencarp5_solve
+from reference.solvers.python.julia_kvaerno5 import solve as julia_kvaerno5_solve
+from reference.solvers.python.julia_rodas5 import solve as julia_rodas5_solve
+from solvers.kencarp5 import solve as kencarp5_solve
+from solvers.rodas5 import solve as rodas5_solve
 
 _TIMES = jnp.array((0.0, 0.5, 1.0, 2.0), dtype=jnp.float64)
 _N_PAIRS = [15, 25, 35]  # equation pairs → 30D, 50D, 70D
@@ -142,25 +132,21 @@ def _make_params_batch(size, seed):
     )
 
 
-def _run_julia_kaps(
-    benchmark, solver_factory, kaps_system, ensemble_size, ensemble_backend
-):
+def _run_julia_kaps(benchmark, solver, kaps_system, ensemble_size, ensemble_backend):
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = solver_factory(
+    results_np = benchmark_julia_solver(
+        benchmark,
+        solver,
         "kaps",
+        y0=system["y0"],
+        t_span=_TIMES,
+        params=params,
         system_config={
             "n_pairs": system["n_pairs"],
             "epsilon_min": system["epsilon_min"],
         },
         ensemble_backend=ensemble_backend,
-    )
-    results_np = benchmark_julia_solver(
-        benchmark,
-        solve,
-        y0=system["y0"],
-        t_span=_TIMES,
-        params=params,
         first_step=1e-6,
         rtol=1e-6,
         atol=1e-8,
@@ -180,12 +166,13 @@ def test_rodas5(benchmark, kaps_system, ensemble_size, lu_precision):
     """Rodas5 nonlinear benchmark with exact-solution validation."""
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_rodas5(ode_fn=system["ode_fn"], lu_precision=lu_precision)
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: rodas5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
+            lu_precision=lu_precision,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -213,16 +200,14 @@ def test_kencarp5(benchmark, kaps_system, ensemble_size, lu_precision):
     """KenCarp5 nonlinear benchmark with exact-solution validation."""
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kencarp5(
-        explicit_ode_fn=system["explicit_ode_fn"],
-        implicit_ode_fn=system["implicit_ode_fn"],
-        lu_precision=lu_precision,
-    )
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
+            lu_precision=lu_precision,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -249,11 +234,10 @@ def test_diffrax_kencarp5(benchmark, kaps_system, ensemble_size):
     """Diffrax KenCarp5 benchmark on coupled Kaps singular-perturbation systems."""
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_kencarp5_solver(
-        system["explicit_ode_fn"], system["implicit_ode_fn"]
-    )
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -288,9 +272,9 @@ def test_diffrax_kvaerno5(benchmark, kaps_system, ensemble_size):
     """Diffrax Kvaerno5 benchmark on coupled Kaps singular-perturbation systems."""
     system = kaps_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kvaerno5_solver(system["ode_fn"])
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kvaerno5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -325,7 +309,7 @@ def test_julia_kencarp5(benchmark, kaps_system, ensemble_size, ensemble_backend)
     """Julia KenCarp5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_kaps(
         benchmark,
-        make_julia_kencarp5_solver,
+        julia_kencarp5_solve,
         kaps_system,
         ensemble_size,
         ensemble_backend,
@@ -352,7 +336,7 @@ def test_julia_rodas5(benchmark, kaps_system, ensemble_size, ensemble_backend):
     """Julia Rodas5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_kaps(
         benchmark,
-        make_julia_rodas5_solver,
+        julia_rodas5_solve,
         kaps_system,
         ensemble_size,
         ensemble_backend,
@@ -379,7 +363,7 @@ def test_julia_kvaerno5(benchmark, kaps_system, ensemble_size, ensemble_backend)
     """Julia Kvaerno5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_kaps(
         benchmark,
-        make_julia_kvaerno5_solver,
+        julia_kvaerno5_solve,
         kaps_system,
         ensemble_size,
         ensemble_backend,

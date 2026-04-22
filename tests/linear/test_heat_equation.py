@@ -37,29 +37,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.kencarp5 import make_solver as make_kencarp5
-from solvers.rodas5 import make_solver as make_rodas5
-from reference.solvers.python.diffrax_kencarp5 import (
-    make_solver as make_diffrax_kencarp5_solver,
-)
-from reference.solvers.python.diffrax_kvaerno5 import (
-    make_solver as make_kvaerno5_solver,
-)
+from reference.solvers.python.diffrax_kencarp5 import solve as diffrax_kencarp5_solve
+from reference.solvers.python.diffrax_kvaerno5 import solve as diffrax_kvaerno5_solve
 from reference.solvers.python.julia_common import (
     JULIA_ENSEMBLE_BACKENDS,
     benchmark_julia_solver,
     julia_backend_id,
     maybe_mark_large_ensemble_sizes,
 )
-from reference.solvers.python.julia_kencarp5 import (
-    make_solver as make_julia_kencarp5_solver,
-)
-from reference.solvers.python.julia_kvaerno5 import (
-    make_solver as make_julia_kvaerno5_solver,
-)
-from reference.solvers.python.julia_rodas5 import (
-    make_solver as make_julia_rodas5_solver,
-)
+from reference.solvers.python.julia_kencarp5 import solve as julia_kencarp5_solve
+from reference.solvers.python.julia_kvaerno5 import solve as julia_kvaerno5_solve
+from reference.solvers.python.julia_rodas5 import solve as julia_rodas5_solve
+from solvers.kencarp5 import solve as kencarp5_solve
+from solvers.rodas5 import solve as rodas5_solve
 
 _TIMES = jnp.array((0.0, 0.025, 0.05, 0.075, 0.1), dtype=jnp.float64)
 _SYSTEM_DIMS = [30, 50, 70]
@@ -139,22 +129,18 @@ def _make_params_batch(size, seed):
     )
 
 
-def _run_julia_heat(
-    benchmark, solver_factory, heat_system, ensemble_size, ensemble_backend
-):
+def _run_julia_heat(benchmark, solver, heat_system, ensemble_size, ensemble_backend):
     system = heat_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = solver_factory(
-        "heat_equation",
-        system_config={"n_vars": system["n_vars"]},
-        ensemble_backend=ensemble_backend,
-    )
     results_np = benchmark_julia_solver(
         benchmark,
-        solve,
+        solver,
+        "heat_equation",
         y0=system["y0"],
         t_span=_TIMES,
         params=params,
+        system_config={"n_vars": system["n_vars"]},
+        ensemble_backend=ensemble_backend,
         first_step=1e-6,
         rtol=1e-6,
         atol=1e-8,
@@ -175,12 +161,13 @@ def test_rodas5(benchmark, heat_system, ensemble_size, lu_precision):
     """Rodas5 nonlinear benchmark with exact-solution validation."""
     system = heat_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_rodas5(ode_fn=system["ode_fn"], lu_precision=lu_precision)
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: rodas5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
+            lu_precision=lu_precision,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -204,17 +191,15 @@ def test_kencarp5(benchmark, heat_system, ensemble_size, lu_precision):
     """KenCarp5 nonlinear benchmark with exact-solution validation."""
     system = heat_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kencarp5(
-        explicit_ode_fn=system["explicit_ode_fn"],
-        implicit_ode_fn=system["implicit_ode_fn"],
-        lu_precision=lu_precision,
-        linear=True,
-    )
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
+            lu_precision=lu_precision,
+            linear=True,
             first_step=1e-6,
             rtol=1e-6,
             atol=1e-8,
@@ -242,11 +227,10 @@ def test_diffrax_kencarp5(benchmark, heat_system, ensemble_size):
     """Diffrax KenCarp5 benchmark with exact-solution validation."""
     system = heat_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_kencarp5_solver(
-        system["explicit_ode_fn"], system["implicit_ode_fn"]
-    )
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -278,9 +262,9 @@ def test_diffrax_kvaerno5(benchmark, heat_system, ensemble_size):
     """Diffrax Kvaerno5 benchmark with exact-solution validation."""
     system = heat_system
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kvaerno5_solver(system["ode_fn"])
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kvaerno5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -311,7 +295,7 @@ def test_julia_kencarp5(benchmark, heat_system, ensemble_size, ensemble_backend)
     """Julia KenCarp5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_heat(
         benchmark,
-        make_julia_kencarp5_solver,
+        julia_kencarp5_solve,
         heat_system,
         ensemble_size,
         ensemble_backend,
@@ -334,7 +318,7 @@ def test_julia_rodas5(benchmark, heat_system, ensemble_size, ensemble_backend):
     """Julia Rodas5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_heat(
         benchmark,
-        make_julia_rodas5_solver,
+        julia_rodas5_solve,
         heat_system,
         ensemble_size,
         ensemble_backend,
@@ -357,7 +341,7 @@ def test_julia_kvaerno5(benchmark, heat_system, ensemble_size, ensemble_backend)
     """Julia Kvaerno5 benchmark with exact-solution validation."""
     system, results_np, params = _run_julia_heat(
         benchmark,
-        make_julia_kvaerno5_solver,
+        julia_kvaerno5_solve,
         heat_system,
         ensemble_size,
         ensemble_backend,

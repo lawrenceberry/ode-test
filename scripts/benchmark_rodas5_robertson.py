@@ -9,8 +9,8 @@ the script to regenerate the plot skips already-collected data points.
 
 import json
 import subprocess
-import time
 import sys
+import time
 from pathlib import Path
 
 import jax
@@ -20,14 +20,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from solvers.rodas5 import solve as rodas5_solve
-from reference.solvers.python.diffrax_kvaerno5 import (
-    make_solver as make_kvaerno5_solver,
-)
+from reference.solvers.python.diffrax_kvaerno5 import solve as diffrax_kvaerno5_solve
 from reference.solvers.python.julia_common import _check_julia_environment
-from reference.solvers.python.julia_rodas5 import (
-    make_solver as make_julia_rodas5_solver,
-)
+from reference.solvers.python.julia_rodas5 import solve as julia_rodas5_solve
+from solvers.rodas5 import solve as rodas5_solve
 
 _TIMES = jnp.array((0.0, 1e-6, 1e-2, 1e2, 1e5), dtype=jnp.float64)
 _ENSEMBLE_SIZES = [2, 10, 100, 1000, 10000, 100000]
@@ -170,9 +166,10 @@ def time_rodas5(ode_fn, y0, params, lu_precision) -> float:
     return (time.perf_counter() - t0) * 1000
 
 
-def time_kvaerno5(solve, y0, params) -> float:
+def time_kvaerno5(ode_fn, y0, params) -> float:
     def run():
-        return solve(
+        return diffrax_kvaerno5_solve(
+            ode_fn,
             y0=y0,
             t_span=_TIMES,
             params=params,
@@ -187,12 +184,17 @@ def time_kvaerno5(solve, y0, params) -> float:
     return (time.perf_counter() - t0) * 1000
 
 
-def time_julia_rodas5(solve, y0, params) -> float:
+def time_julia_rodas5(
+    solve, system_name, y0, params, *, system_config, ensemble_backend
+) -> float:
     """Return Julia's internal solve time in ms (excludes subprocess/startup overhead)."""
     result = solve._julia_solve_with_timing(
-        y0=y0,
-        t_span=_TIMES,
-        params=np.asarray(params),
+        system_name,
+        y0,
+        _TIMES,
+        np.asarray(params),
+        system_config=system_config,
+        ensemble_backend=ensemble_backend,
         first_step=1e-4,
         rtol=1e-6,
         atol=1e-8,
@@ -243,7 +245,6 @@ def main():
             timings[precision].append(ms)
 
     kvaerno5_timings: list[float | None] = []
-    kvaerno5_solve = make_kvaerno5_solver(ode_fn)
     for size in _ENSEMBLE_SIZES:
         params = make_params_batch(size)
         ms = collect_or_load(
@@ -251,7 +252,7 @@ def main():
             "diffrax_kvaerno5",
             size,
             "diffrax kvaerno5",
-            lambda params=params: time_kvaerno5(kvaerno5_solve, y0, params),
+            lambda params=params: time_kvaerno5(ode_fn, y0, params),
         )
         kvaerno5_timings.append(ms)
 
@@ -260,9 +261,6 @@ def main():
     if julia_check["ok"]:
         for backend in _JULIA_BACKENDS:
             julia_timings[backend] = []
-            solve = make_julia_rodas5_solver(
-                "robertson", system_config={}, ensemble_backend=backend
-            )
             solver_key = f"julia_rodas5_{backend}"
             label = _JULIA_LABELS[backend]
             for size in _ENSEMBLE_SIZES:
@@ -272,7 +270,14 @@ def main():
                     solver_key,
                     size,
                     label,
-                    lambda params=params: time_julia_rodas5(solve, y0, params),
+                    lambda params=params, backend=backend: time_julia_rodas5(
+                        julia_rodas5_solve,
+                        "robertson",
+                        y0,
+                        params,
+                        system_config={},
+                        ensemble_backend=backend,
+                    ),
                 )
                 julia_timings[backend].append(ms)
     else:

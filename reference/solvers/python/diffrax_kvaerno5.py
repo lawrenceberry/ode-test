@@ -252,147 +252,126 @@ def _solve_with_diffrax(
     return jax.jit(jax.vmap(_solve_one), backend=backend)(params_arr)
 
 
-def make_solver(ode_fn):
-    """Create a reusable Kvaerno5 ensemble solver.
+@functools.partial(jax.jit, static_argnames=("ode_fn", "max_steps"))
+def solve(
+    ode_fn,
+    y0,
+    t_span,
+    params,
+    *,
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
+):
+    """Solve a Kvaerno5 ensemble with Diffrax.
 
     Parameters
     ----------
     ode_fn : callable
         ODE right-hand side with signature ``ode_fn(y, t, params) -> dy/dt``.
+    y0 : array, shape [n_vars]
+        Shared initial state.
+    t_span : array-like, shape [n_save]
+        Strictly increasing array of save times (len >= 2).
+    params : array, shape [N, ...]
+        Per-trajectory parameters.
+
+    Returns
+    -------
+    array, shape [N, n_save, n_vars]
     """
+    y0_arr = jnp.asarray(y0, dtype=jnp.float64)
+    params_arr = jnp.asarray(params)
+    save_times = jnp.asarray(t_span, dtype=jnp.float64)
+    dt0 = jnp.float64(
+        first_step
+        if first_step is not None
+        else (save_times[-1] - save_times[0]) * 1e-6
+    )
+    t0 = save_times[0]
+    tf = save_times[-1]
 
-    @functools.partial(jax.jit, static_argnames=("max_steps",))
-    def _solve_impl(y0_arr, save_times, params_arr, *, rtol, atol, dt0, max_steps):
-        t0 = save_times[0]
-        tf = save_times[-1]
-
-        def _solve_one(p):
-            term = diffrax.ODETerm(lambda t, y, args: ode_fn(y, t, p))
-            solver = diffrax.Kvaerno5()
-            controller = diffrax.PIDController(rtol=rtol, atol=atol)
-            sol = diffrax.diffeqsolve(
-                term,
-                solver,
-                t0=t0,
-                t1=tf,
-                dt0=dt0,
-                y0=y0_arr,
-                stepsize_controller=controller,
-                max_steps=max_steps,
-                saveat=diffrax.SaveAt(ts=save_times),
-            )
-            return sol.ys
-
-        return jax.vmap(_solve_one)(params_arr)
-
-    def _solve(
-        y0,
-        t_span,
-        params,
-        *,
-        rtol=1e-8,
-        atol=1e-10,
-        first_step=None,
-        max_steps=100000,
-    ):
-        """Solve an ensemble of ODEs.
-
-        Parameters
-        ----------
-        y0 : array, shape [n_vars]
-            Shared initial state.
-        t_span : array-like, shape [n_save]
-            Strictly increasing array of save times (len >= 2).
-        params : array, shape [N, ...]
-            Per-trajectory parameters.
-
-        Returns
-        -------
-        array, shape [N, n_save, n_vars]
-        """
-        y0_arr = jnp.asarray(y0, dtype=jnp.float64)
-        params_arr = jnp.asarray(params)
-        times_np = np.asarray(t_span, dtype=np.float64)
-        save_times = jnp.asarray(times_np, dtype=jnp.float64)
-        dt0 = jnp.float64(
-            first_step
-            if first_step is not None
-            else (times_np[-1] - times_np[0]) * 1e-6
-        )
-        return _solve_impl(
-            y0_arr,
-            save_times,
-            params_arr,
-            rtol=rtol,
-            atol=atol,
+    def _solve_one(p):
+        term = diffrax.ODETerm(lambda t, y, args: ode_fn(y, t, p))
+        solver = diffrax.Kvaerno5()
+        controller = diffrax.PIDController(rtol=rtol, atol=atol)
+        sol = diffrax.diffeqsolve(
+            term,
+            solver,
+            t0=t0,
+            t1=tf,
             dt0=dt0,
+            y0=y0_arr,
+            stepsize_controller=controller,
             max_steps=max_steps,
+            saveat=diffrax.SaveAt(ts=save_times),
         )
+        return sol.ys
 
-    return _solve
+    return jax.vmap(_solve_one)(params_arr)
 
 
-def make_cached_solver(ode_fn, cache_dir=None):
-    """Create a cached Kvaerno5 ensemble solver with the same solve signature."""
+def solve_cached(
+    ode_fn,
+    y0,
+    t_span,
+    params,
+    *,
+    cache_dir=None,
+    rtol=1e-8,
+    atol=1e-10,
+    first_step=None,
+    max_steps=100000,
+):
+    """Solve a Kvaerno5 ensemble with an on-disk Diffrax output cache."""
     cache_root = Path(cache_dir) if cache_dir is not None else _CACHE_ROOT
 
-    def _solve(
-        y0,
-        t_span,
-        params,
-        *,
-        rtol=1e-8,
-        atol=1e-10,
-        first_step=None,
-        max_steps=100000,
-    ):
-        y0_arr = np.asarray(y0, dtype=np.float64)
-        params_arr = np.asarray(params)
-        save_times_arr = np.asarray(t_span, dtype=np.float64)
-        key_data = _make_cache_key_data(
+    y0_arr = np.asarray(y0, dtype=np.float64)
+    params_arr = np.asarray(params)
+    save_times_arr = np.asarray(t_span, dtype=np.float64)
+    key_data = _make_cache_key_data(
+        ode_fn,
+        y0_arr,
+        save_times_arr,
+        params_arr,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+    )
+    cache_key = _cache_key_from_data(key_data)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    npz_path = cache_root / f"{cache_key}.npz"
+    json_path = cache_root / f"{cache_key}.json"
+
+    if npz_path.exists():
+        with np.load(npz_path) as data:
+            ys_np = data["ys"]
+    else:
+        ys = _solve_with_diffrax(
             ode_fn,
-            y0_arr,
-            save_times_arr,
-            params_arr,
+            jnp.asarray(y0_arr, dtype=jnp.float64),
+            jnp.asarray(save_times_arr, dtype=jnp.float64),
+            jnp.asarray(params_arr),
             rtol=rtol,
             atol=atol,
             first_step=first_step,
             max_steps=max_steps,
         )
-        cache_key = _cache_key_from_data(key_data)
-        cache_root.mkdir(parents=True, exist_ok=True)
-        npz_path = cache_root / f"{cache_key}.npz"
-        json_path = cache_root / f"{cache_key}.json"
+        ys_np = np.asarray(ys)
 
-        if npz_path.exists():
-            with np.load(npz_path) as data:
-                ys_np = data["ys"]
-        else:
-            ys = _solve_with_diffrax(
-                ode_fn,
-                jnp.asarray(y0_arr, dtype=jnp.float64),
-                jnp.asarray(save_times_arr, dtype=jnp.float64),
-                jnp.asarray(params_arr),
-                rtol=rtol,
-                atol=atol,
-                first_step=first_step,
-                max_steps=max_steps,
-            )
-            ys_np = np.asarray(ys)
-
-            _write_npz_atomic(npz_path, ys_np)
-            _write_json_atomic(
-                json_path,
-                {
-                    "cache_key": cache_key,
-                    **key_data,
-                    "output": {
-                        "dtype": str(ys_np.dtype),
-                        "shape": list(ys_np.shape),
-                    },
+        _write_npz_atomic(npz_path, ys_np)
+        _write_json_atomic(
+            json_path,
+            {
+                "cache_key": cache_key,
+                **key_data,
+                "output": {
+                    "dtype": str(ys_np.dtype),
+                    "shape": list(ys_np.shape),
                 },
-            )
+            },
+        )
 
-        return jnp.asarray(ys_np, dtype=jnp.float64)
-
-    return _solve
+    return jnp.asarray(ys_np, dtype=jnp.float64)

@@ -4,16 +4,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from solvers.kencarp5 import solve as kencarp5_solve
-from solvers.rodas5 import solve as rodas5_solve
-from reference.solvers.python.diffrax_kencarp5 import (
-    make_solver as make_diffrax_kencarp5_solver,
-)
+from reference.solvers.python.diffrax_kencarp5 import solve as diffrax_kencarp5_solve
+from reference.solvers.python.diffrax_kvaerno5 import solve as diffrax_kvaerno5_solve
 from reference.solvers.python.diffrax_kvaerno5 import (
-    make_cached_solver as make_cached_kvaerno5_solver,
-)
-from reference.solvers.python.diffrax_kvaerno5 import (
-    make_solver as make_kvaerno5_solver,
+    solve_cached as diffrax_kvaerno5_solve_cached,
 )
 from reference.solvers.python.julia_common import (
     JULIA_ENSEMBLE_BACKENDS,
@@ -21,15 +15,10 @@ from reference.solvers.python.julia_common import (
     julia_backend_id,
     maybe_mark_large_ensemble_sizes,
 )
-from reference.solvers.python.julia_kencarp5 import (
-    make_solver as make_julia_kencarp5_solver,
-)
-from reference.solvers.python.julia_kvaerno5 import (
-    make_solver as make_julia_kvaerno5_solver,
-)
-from reference.solvers.python.julia_rodas5 import (
-    make_solver as make_julia_rodas5_solver,
-)
+from reference.solvers.python.julia_kencarp5 import solve as julia_kencarp5_solve
+from reference.solvers.python.julia_rodas5 import solve as julia_rodas5_solve
+from solvers.kencarp5 import solve as kencarp5_solve
+from solvers.rodas5 import solve as rodas5_solve
 
 _TIMES = jnp.array((0.0, 1e-6, 1e-2, 1e2, 1e5), dtype=jnp.float64)
 _ENSEMBLE_SIZES = [2, 100, 1000, 10000]
@@ -92,20 +81,18 @@ def _make_params_batch(size, seed):
     )
 
 
-def _run_julia_robertson(benchmark, solver_factory, ensemble_size, ensemble_backend):
+def _run_julia_robertson(benchmark, solver, ensemble_size, ensemble_backend):
     system = _make_robertson_system()
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = solver_factory(
-        "robertson",
-        system_config={},
-        ensemble_backend=ensemble_backend,
-    )
     results_np = benchmark_julia_solver(
         benchmark,
-        solve,
+        solver,
+        "robertson",
         y0=system["y0"],
         t_span=_TIMES,
         params=params,
+        system_config={},
+        ensemble_backend=ensemble_backend,
         first_step=1e-4,
         rtol=1e-6,
         atol=1e-8,
@@ -144,8 +131,8 @@ def test_rodas5(benchmark, ensemble_size, lu_precision):
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
 
     if ensemble_size in _REFERENCE_ENSEMBLE_SIZES:
-        solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
-        y_ref = solve_ref(
+        y_ref = diffrax_kvaerno5_solve_cached(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -183,8 +170,8 @@ def test_kencarp5(benchmark, ensemble_size, lu_precision):
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
 
     # if ensemble_size in _REFERENCE_ENSEMBLE_SIZES:
-    #     solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
-    #     y_ref = solve_ref(
+    #     y_ref = diffrax_kvaerno5_solve_cached(
+    #         system["ode_fn"],
     #         y0=system["y0"],
     #         t_span=_TIMES,
     #         params=params,
@@ -211,9 +198,9 @@ def test_diffrax_kvaerno5(benchmark, ensemble_size):
     """Diffrax Kvaerno5 benchmark with conservation validation."""
     system = _make_robertson_system()
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_kvaerno5_solver(system["ode_fn"])
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kvaerno5_solve(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -235,11 +222,10 @@ def test_diffrax_kencarp5(benchmark, ensemble_size):
     """Diffrax KenCarp5 benchmark with cached Diffrax validation on practical ensemble sizes."""
     system = _make_robertson_system()
     params = _make_params_batch(ensemble_size, seed=42)
-    solve = make_diffrax_kencarp5_solver(
-        system["explicit_ode_fn"], system["implicit_ode_fn"]
-    )
     results = benchmark.pedantic(
-        lambda: solve(
+        lambda: diffrax_kencarp5_solve(
+            system["explicit_ode_fn"],
+            system["implicit_ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -256,8 +242,8 @@ def test_diffrax_kencarp5(benchmark, ensemble_size):
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
 
     if ensemble_size in _REFERENCE_ENSEMBLE_SIZES:
-        solve_ref = make_cached_kvaerno5_solver(system["ode_fn"])
-        y_ref = solve_ref(
+        y_ref = diffrax_kvaerno5_solve_cached(
+            system["ode_fn"],
             y0=system["y0"],
             t_span=_TIMES,
             params=params,
@@ -277,7 +263,7 @@ def test_diffrax_kencarp5(benchmark, ensemble_size):
 def test_julia_rodas5(benchmark, ensemble_size, ensemble_backend):
     """Julia Rodas5 benchmark with conservation validation."""
     system, results_np = _run_julia_robertson(
-        benchmark, make_julia_rodas5_solver, ensemble_size, ensemble_backend
+        benchmark, julia_rodas5_solve, ensemble_size, ensemble_backend
     )
     assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
@@ -292,7 +278,7 @@ def test_julia_rodas5(benchmark, ensemble_size, ensemble_backend):
 def test_julia_kencarp5(benchmark, ensemble_size, ensemble_backend):
     """Julia KenCarp5 benchmark with conservation validation."""
     system, results_np = _run_julia_robertson(
-        benchmark, make_julia_kencarp5_solver, ensemble_size, ensemble_backend
+        benchmark, julia_kencarp5_solve, ensemble_size, ensemble_backend
     )
     assert results_np.shape == (ensemble_size, len(_TIMES), system["n_vars"])
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
