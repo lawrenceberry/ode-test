@@ -95,8 +95,9 @@ def solve(
     ----------
     ode_fn : callable
         ODE right-hand side with signature ``ode_fn(y, t, params) -> dy/dt``.
-    y0 : array, shape (n_vars,)
-        Initial state shared by all trajectories.
+    y0 : array, shape (n_vars,) or (N, n_vars)
+        Initial state. A 1-D array is broadcast to all trajectories; a 2-D
+        array supplies a distinct starting point for each trajectory.
     t_span : array-like, shape (n_save,)
         Strictly-increasing 1-D array of save times (including t0).
     params : array, shape (N, ...)
@@ -122,8 +123,13 @@ def solve(
     params_arr = jnp.asarray(params)
     times = jnp.asarray(t_span, dtype=jnp.float64)
 
-    n_vars = y0_arr.shape[0]
     N = params_arr.shape[0]
+    if y0_arr.ndim == 1:
+        n_vars = y0_arr.shape[0]
+        y0_batched = jnp.broadcast_to(y0_arr, (N, n_vars))
+    else:
+        n_vars = y0_arr.shape[1]
+        y0_batched = y0_arr
     n_save = times.shape[0]
     tf = times[-1]
 
@@ -141,13 +147,19 @@ def solve(
             (n_padded - N,) + params_arr.shape[1:],
         )
         params_padded = jnp.concatenate([params_arr, pad_rows], axis=0)
+        y0_padded = jnp.concatenate(
+            [y0_batched, jnp.broadcast_to(y0_batched[-1:], (n_padded - N, n_vars))],
+            axis=0,
+        )
     else:
         params_padded = params_arr
+        y0_padded = y0_batched
 
     params_batches = params_padded.reshape((n_chunks, bs) + params_arr.shape[1:])
+    y0_batches = y0_padded.reshape((n_chunks, bs, n_vars))
 
-    def _solve_batch(params_batch):
-        y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
+    def _solve_batch(params_batch, y0_batch):
+        y_init = y0_batch.copy()
         hist_init = (
             jnp.zeros((bs, n_save, n_vars), dtype=jnp.float64).at[:, 0, :].set(y_init)
         )
@@ -278,5 +290,5 @@ def solve(
         _, _, _, hist_final, _, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
         return hist_final
 
-    results = jax.vmap(_solve_batch)(params_batches)
+    results = jax.vmap(_solve_batch)(params_batches, y0_batches)
     return results.reshape(n_padded, n_save, n_vars)[:N]

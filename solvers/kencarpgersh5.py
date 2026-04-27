@@ -304,15 +304,15 @@ def make_solver(
 
     @functools.partial(jax.jit, static_argnames=("n_save", "max_steps"))
     def _solve_impl(
-        y0_arr, params_batches, times, *, n_save, max_steps, dt0, rtol, atol
+        y0_batches, params_batches, times, *, n_save, max_steps, dt0, rtol, atol
     ):
-        n_vars = y0_arr.shape[0]
+        n_vars = y0_batches.shape[2]
         bs = params_batches.shape[1]
         solve_row_masked = _make_reduced_implicit_solver(n_vars, lu_dtype)
         tf = times[-1]
 
-        def _solve_batch(params_batch):
-            y_init = jnp.broadcast_to(y0_arr, (bs, n_vars)).copy()
+        def _solve_batch(params_batch, y0_batch):
+            y_init = y0_batch.copy()
             hist_init = (
                 jnp.zeros((bs, n_save, n_vars), dtype=jnp.float64)
                 .at[:, 0, :]
@@ -587,7 +587,7 @@ def make_solver(
             _, _, _, hist_final, _, _ = jax.lax.while_loop(cond_fn, body_fn, init)
             return hist_final
 
-        return jax.vmap(_solve_batch)(params_batches)
+        return jax.vmap(_solve_batch)(params_batches, y0_batches)
 
     def _solve(
         y0,
@@ -601,8 +601,13 @@ def make_solver(
     ):
         y0_arr = jnp.asarray(y0, dtype=jnp.float64)
         params_arr = jnp.asarray(params)
-        n_vars = int(y0_arr.shape[0])
         N = int(params_arr.shape[0])
+        if y0_arr.ndim == 1:
+            n_vars = int(y0_arr.shape[0])
+            y0_batched = jnp.broadcast_to(y0_arr, (N, n_vars))
+        else:
+            n_vars = int(y0_arr.shape[1])
+            y0_batched = y0_arr
         times = np.asarray(t_span, dtype=np.float64)
         if times.ndim != 1:
             raise ValueError(
@@ -629,12 +634,18 @@ def make_solver(
                 (n_padded - N,) + params_arr.shape[1:],
             )
             params_padded = jnp.concatenate([params_arr, pad_rows], axis=0)
+            y0_padded = jnp.concatenate(
+                [y0_batched, jnp.broadcast_to(y0_batched[-1:], (n_padded - N, n_vars))],
+                axis=0,
+            )
         else:
             params_padded = params_arr
+            y0_padded = y0_batched
 
         params_batches = params_padded.reshape((n_chunks, bs) + params_arr.shape[1:])
+        y0_batches = y0_padded.reshape((n_chunks, bs, n_vars))
         results = _solve_impl(
-            y0_arr,
+            y0_batches,
             params_batches,
             times_jnp,
             n_save=int(times.size),
