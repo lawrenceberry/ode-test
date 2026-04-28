@@ -2,7 +2,27 @@
 
 This benchmark measures wall time and wasted lane work when Robertson
 trajectories with increasingly varied initial conditions share a Rodas5
-while-loop batch. All cases use identical stiffness parameters.
+while-loop batch.
+
+Initial condition design
+------------------------
+The Robertson system has three species (y1, y2, y3) with conservation law
+y1 + y2 + y3 = 1 and rate constants k1=0.04, k2=1e4, k3 (varied).  The
+dominant source of stiffness is the fast eigenvalue ~ -k3*y2: when y2 is
+large the solver must take tiny steps; when y2 = 0 the fast mode is absent
+and large steps are possible.
+
+The hardest possible IC is therefore y = [0, 1, 0] with k3 = k3_max = 3e9:
+all mass sits in the fast species at the highest rate constant, so the solver
+faces eigenvalue magnitude ~3e9 from t=0.  This is set as _HARD_Y0 and used
+as the IC for the identical scenario, with k3=k3_max for every trajectory.
+
+The ic_large scenario generates ICs on the y2=0 edge of the simplex:
+y2=0, y1 ~ U(0, 1), y3 = 1 - y1. Starting with y2=0 means the fast
+eigenvalue is zero at t=0 regardless of k3, so every ic_large trajectory is
+analytically easier than the identical base without needing to run the solver
+to verify.  k3 is drawn log-uniformly over [3e4, 3e9], creating spread in how
+quickly y2 (and therefore stiffness) builds up during the integration.
 
 Usage:
     uv run python scripts/4_rodas5_divergence/main.py
@@ -28,10 +48,10 @@ from solvers.rodas5 import solve as rodas5_solve
 
 jax.config.update("jax_enable_x64", True)
 
-_N_TRAJ = 10_000
+_N_TRAJ = 100_000
 _T_SPAN = robertson.TIMES
-_N_RUNS = 5
-_BATCH_SIZES = tuple(np.unique(np.logspace(0, np.log10(_N_TRAJ), num=10, dtype=int)))
+_N_RUNS = 1
+_BATCH_SIZES = (10_000, 25_000, 50_000, 100_000)
 _SOLVER_KWARGS = {
     "first_step": 1e-4,
     "rtol": 1e-6,
@@ -42,9 +62,16 @@ _SOLVER_KWARGS = {
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _CACHE_PATH = _SCRIPT_DIR / "results.json"
 
-_ROBERTSON_PARAMS = np.array([0.04, 1e4, 3e7], dtype=np.float64)
-_PARAMS = jnp.asarray(
-    np.broadcast_to(_ROBERTSON_PARAMS, (_N_TRAJ, 3)).copy(),
+_K3_MAX = 3e9
+_rng_params = np.random.default_rng(0)
+_k3_varied = np.exp(_rng_params.uniform(np.log(3e4), np.log(_K3_MAX), size=_N_TRAJ))
+
+_PARAMS_IDENTICAL = jnp.array(
+    np.column_stack([np.full(_N_TRAJ, 0.04), np.full(_N_TRAJ, 1e4), np.full(_N_TRAJ, _K3_MAX)]),
+    dtype=jnp.float64,
+)
+_PARAMS_IC_LARGE = jnp.array(
+    np.column_stack([np.full(_N_TRAJ, 0.04), np.full(_N_TRAJ, 1e4), _k3_varied]),
     dtype=jnp.float64,
 )
 
@@ -54,8 +81,7 @@ class Scenario:
     key: str
     label: str
     color: str
-    max_shift: float
-    concentration: float | None = None
+    params: jnp.ndarray
 
 
 @dataclass(frozen=True)
@@ -66,9 +92,11 @@ class Grouping:
     marker: str
 
 
+_HARD_Y0 = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
 _SCENARIOS = (
-    Scenario("identical", "identical", "#2b7be0", 0.0, None),
-    Scenario("ic_large", "large y0", "#e02b2b", 1.0, 1.0),
+    Scenario("identical", "identical", "#2b7be0", _PARAMS_IDENTICAL),
+    Scenario("ic_large", "large y0", "#e02b2b", _PARAMS_IC_LARGE),
 )
 
 _GROUPINGS = (
@@ -130,23 +158,11 @@ def save_cache(cache: dict) -> None:
 def make_initial_conditions(
     scenario: Scenario, size: int, seed: int = 42
 ) -> np.ndarray:
-    y0_base = np.asarray(robertson.Y0, dtype=np.float64)
-    if scenario.max_shift == 0.0:
-        return np.broadcast_to(y0_base, (size, robertson.N_VARS)).copy()
-
+    if scenario.key == "identical":
+        return np.broadcast_to(_HARD_Y0, (size, robertson.N_VARS)).copy()
     rng = np.random.default_rng(seed)
-    if scenario.max_shift >= 1.0:
-        return rng.dirichlet(
-            np.full(robertson.N_VARS, scenario.concentration, dtype=np.float64),
-            size=size,
-        )
-
-    shifted_mass = rng.random(size) * scenario.max_shift
-    split = rng.random(size)
-    y0 = np.empty((size, robertson.N_VARS), dtype=np.float64)
-    y0[:, 0] = 1.0 - shifted_mass
-    y0[:, 1] = shifted_mass * split
-    y0[:, 2] = shifted_mass * (1.0 - split)
+    y1 = rng.uniform(0.0, 1.0, size)
+    y0 = np.column_stack([y1, np.zeros(size), 1.0 - y1])
     return y0
 
 
@@ -183,33 +199,35 @@ def format_stats(row: dict) -> str:
     )
 
 
-def solve_with_stats(y0: np.ndarray, batch_size: int):
+def solve_with_stats(y0: np.ndarray, params: jnp.ndarray, batch_size: int | None):
     return rodas5_solve(
         robertson.ode_fn,
         y0=jnp.asarray(y0, dtype=jnp.float64),
         t_span=_T_SPAN,
-        params=_PARAMS,
+        params=params,
         batch_size=batch_size,
         return_stats=True,
         **_SOLVER_KWARGS,
     )
 
 
-def time_solve_with_stats(y0: np.ndarray, batch_size: int) -> tuple[float, dict]:
-    result = solve_with_stats(y0, batch_size)
+def time_solve_with_stats(
+    y0: np.ndarray, params: jnp.ndarray, batch_size: int | None
+) -> tuple[float, dict]:
+    result = solve_with_stats(y0, params, batch_size)
     jax.block_until_ready(result)
 
     t0 = time.perf_counter()
     for _ in range(_N_RUNS):
-        result = solve_with_stats(y0, batch_size)
+        result = solve_with_stats(y0, params, batch_size)
         jax.block_until_ready(result)
     ms = (time.perf_counter() - t0) / _N_RUNS * 1000
     _, stats = result
     return ms, summarize_stats(stats)
 
 
-def active_attempt_order(y0: np.ndarray) -> np.ndarray:
-    _, stats = solve_with_stats(y0, batch_size=1)
+def active_attempt_order(y0: np.ndarray, params: jnp.ndarray) -> np.ndarray:
+    _, stats = solve_with_stats(y0, params, batch_size=None)
     jax.block_until_ready(stats)
     accepted_steps = np.asarray(jax.device_get(stats["accepted_steps"]))
     rejected_steps = np.asarray(jax.device_get(stats["rejected_steps"]))
@@ -221,7 +239,7 @@ def order_initial_conditions(
     y0: np.ndarray, scenario: Scenario, grouping: Grouping
 ) -> np.ndarray:
     if grouping.key == "sorted":
-        return y0[active_attempt_order(y0)]
+        return y0[active_attempt_order(y0, scenario.params)]
     seed = sum(ord(c) for c in f"{scenario.key}:{grouping.key}")
     rng = np.random.default_rng(seed)
     return y0[rng.permutation(y0.shape[0])]
@@ -252,7 +270,7 @@ def collect_row(
         flush=True,
     )
     try:
-        ms, stats = time_solve_with_stats(y0, batch_size)
+        ms, stats = time_solve_with_stats(y0, scenario.params, batch_size)
     except Exception as exc:
         print(f"FAILED ({exc})")
         return None

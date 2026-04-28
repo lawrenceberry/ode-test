@@ -5,6 +5,28 @@ trajectories with different adaptive step counts share a while-loop batch.
 Timing alone can stay fairly flat when fixed GPU/JAX overhead dominates, so
 the wasted lane-iteration ratio is recorded as the direct mechanism signal.
 
+Initial condition design
+------------------------
+The Lorenz system is run with rho=0.5, which places it below the pitchfork
+bifurcation at rho=1. In this regime the origin is the unique globally stable
+fixed point, so every trajectory decays exponentially toward (0, 0, 0) with
+slowest eigenvalue lambda ~ -0.47.
+
+Step count is therefore strictly monotone in distance from the origin: a
+trajectory that starts far away must cross a large region of phase space with
+significant ODE velocities before the state becomes small enough for Tsit5 to
+take large steps.
+
+The hard base IC, _HARD_Y0 = [1000, -500, 500], is fixed analytically as a
+point far from the origin. The identical scenario places every trajectory
+there, so all share the same (maximum) step count and the batch shows zero
+divergence. The ic_large scenario scales each trajectory as _HARD_Y0 * (1-t)
+for t ~ U(0, 1), moving it radially toward the origin. Because distance from
+the origin is the sole driver of difficulty, this construction guarantees that
+every ic_large trajectory is strictly easier than the identical base, and the
+step counts span a continuous range from near-maximum (t -> 0) down to
+near-zero (t -> 1).
+
 Usage:
     uv run python scripts/2_tsit5_divergence/main.py
 """
@@ -29,16 +51,16 @@ from solvers.tsit5 import solve as tsit5_solve
 
 jax.config.update("jax_enable_x64", True)
 
-_N_TRAJ = 10_000
+_N_TRAJ = 400_000
 _T_SPAN = (0.0, 5.0)
 _N_RUNS = 5
-_BATCH_SIZES = tuple(np.unique(np.logspace(0, np.log10(_N_TRAJ), num=10, dtype=int)))
+_BATCH_SIZES = (5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 400_000)
 _SOLVER_KWARGS = {"first_step": 1e-4, "rtol": 1e-6, "atol": 1e-8}
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _CACHE_PATH = _SCRIPT_DIR / "results.json"
 
-_RHO = 28.0
+_RHO = 0.5
 _PARAMS = jnp.full((_N_TRAJ, 1), _RHO, dtype=jnp.float64)
 
 
@@ -47,7 +69,6 @@ class Scenario:
     key: str
     label: str
     color: str
-    y0_std: float | None = None
 
 
 @dataclass(frozen=True)
@@ -59,8 +80,8 @@ class Grouping:
 
 
 _SCENARIOS = (
-    Scenario("ic_identical", "identical y0", "#2b7be0", 0.0),
-    Scenario("ic_large", "large dy0", "#e02b2b", 20.0),
+    Scenario("ic_identical", "identical y0", "#2b7be0"),
+    Scenario("ic_large", "large dy0", "#e02b2b"),
 )
 
 _GROUPINGS = (
@@ -119,14 +140,17 @@ def save_cache(cache: dict) -> None:
     _CACHE_PATH.write_text(json.dumps(cache, indent=2))
 
 
+_HARD_Y0 = np.array([1000.0, -500.0, 500.0], dtype=np.float64)
+
+
 def make_initial_conditions(
     scenario: Scenario, size: int, seed: int = 42
 ) -> np.ndarray:
-    y0_base = np.asarray(lorenz.Y0, dtype=np.float64)
-    if scenario.y0_std == 0.0:
-        return np.broadcast_to(y0_base, (size, 3)).copy()
+    if scenario.key == "ic_identical":
+        return np.broadcast_to(_HARD_Y0, (size, 3)).copy()
     rng = np.random.default_rng(seed)
-    return y0_base + rng.normal(0.0, scenario.y0_std, (size, 3))
+    t = rng.uniform(0.0, 1.0, size=(size, 1))
+    return _HARD_Y0 * (1.0 - t)
 
 
 def summarize_stats(stats: dict) -> dict[str, float | int]:
@@ -162,7 +186,7 @@ def format_stats(row: dict) -> str:
     )
 
 
-def solve_with_stats(y0: np.ndarray, batch_size: int):
+def solve_with_stats(y0: np.ndarray, batch_size: int | None):
     return tsit5_solve(
         lorenz.ode_fn,
         y0=jnp.asarray(y0, dtype=jnp.float64),
@@ -174,7 +198,7 @@ def solve_with_stats(y0: np.ndarray, batch_size: int):
     )
 
 
-def time_solve_with_stats(y0: np.ndarray, batch_size: int) -> tuple[float, dict]:
+def time_solve_with_stats(y0: np.ndarray, batch_size: int | None) -> tuple[float, dict]:
     result = solve_with_stats(y0, batch_size)
     jax.block_until_ready(result)
 
@@ -188,7 +212,7 @@ def time_solve_with_stats(y0: np.ndarray, batch_size: int) -> tuple[float, dict]
 
 
 def active_attempt_order(y0: np.ndarray) -> np.ndarray:
-    _, stats = solve_with_stats(y0, batch_size=1)
+    _, stats = solve_with_stats(y0, batch_size=None)
     jax.block_until_ready(stats)
     accepted_steps = np.asarray(jax.device_get(stats["accepted_steps"]))
     rejected_steps = np.asarray(jax.device_get(stats["rejected_steps"]))
