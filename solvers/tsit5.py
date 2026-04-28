@@ -335,8 +335,9 @@ def solve(
         }
         return hist_final, batch_stats
 
-    results, batch_stats = jax.vmap(_solve_batch)(
-        params_batches, y0_batches, valid_batches
+    results, batch_stats = jax.lax.map(
+        lambda xs: _solve_batch(*xs),
+        (params_batches, y0_batches, valid_batches),
     )
     solution = results.reshape(n_padded, n_save, n_vars)[:N]
     if not return_stats:
