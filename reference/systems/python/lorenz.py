@@ -47,15 +47,6 @@ def ode_fn(y, t, p):
     )
 
 
-def explicit_ode_fn(y, t, p):
-    return ode_fn(y, t, p)
-
-
-def implicit_ode_fn(y, t, p):
-    del y, t, p
-    return jnp.zeros(N_VARS, dtype=jnp.float64)
-
-
 def make_params(size: int, seed: int = 42) -> jnp.ndarray:
     """ρ values centred at 28 with ±5% uniform perturbation (all chaotic)."""
     rng = np.random.default_rng(seed)

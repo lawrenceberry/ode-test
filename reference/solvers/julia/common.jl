@@ -4,8 +4,8 @@ using StaticArrays
 
 Base.@kwdef struct ReferenceSystemSpec
     build_array_full_problem::Function
-    build_array_split_problem::Function
     build_kernel_full_problem::Function
+    build_array_split_problem::Union{Function,Nothing} = nothing
 end
 
 function parse_config(path::String)

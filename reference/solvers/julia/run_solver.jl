@@ -54,6 +54,9 @@ end
 function make_problem(spec::ReferenceSystemSpec, solver_name::String, ensemble_backend::String, y0, tspan, p0)
     if ensemble_backend == "EnsembleGPUArray"
         if solver_name == "kencarp5"
+            if spec.build_array_split_problem === nothing
+                error("System does not define an explicit/implicit split for KenCarp5")
+            end
             return spec.build_array_split_problem(y0, tspan, p0)
         end
         return spec.build_array_full_problem(y0, tspan, p0)

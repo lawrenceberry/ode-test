@@ -1,6 +1,4 @@
 function make_lorenz_spec(config)
-    n_vars = 3
-    zero_jac! = make_zero_jac!(n_vars)
     sigma = 10.0
     beta = 8.0 / 3.0
 
@@ -26,15 +24,6 @@ function make_lorenz_spec(config)
         return nothing
     end
 
-    function explicit_ode!(du, u, p, t)
-        return ode!(du, u, p, t)
-    end
-
-    function implicit_ode!(du, u, p, t)
-        fill!(du, 0.0)
-        return nothing
-    end
-
     function kernel_ode(u, p, t)
         rho = p[1]
         return @SVector [
@@ -47,13 +36,6 @@ function make_lorenz_spec(config)
     return ReferenceSystemSpec(
         build_array_full_problem=(y0, tspan, p0) -> SciMLBase.ODEProblem(
             SciMLBase.ODEFunction(ode!; jac=jac!, tgrad=zero_tgrad!),
-            copy(y0),
-            tspan,
-            copy(p0),
-        ),
-        build_array_split_problem=(y0, tspan, p0) -> SciMLBase.SplitODEProblem(
-            SciMLBase.ODEFunction(implicit_ode!; jac=zero_jac!, tgrad=zero_tgrad!),
-            SciMLBase.ODEFunction(explicit_ode!; jac=jac!, tgrad=zero_tgrad!),
             copy(y0),
             tspan,
             copy(p0),

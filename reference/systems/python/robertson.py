@@ -19,28 +19,6 @@ def ode_fn(y, t, p):
     )
 
 
-def explicit_ode_fn(y, t, p):
-    del t
-    return jnp.array(
-        [
-            -p[0] * y[0],
-            p[0] * y[0],
-            0.0,
-        ]
-    )
-
-
-def implicit_ode_fn(y, t, p):
-    del t
-    return jnp.array(
-        [
-            p[1] * y[1] * y[2],
-            -p[1] * y[1] * y[2] - p[2] * y[1] ** 2,
-            p[2] * y[1] ** 2,
-        ]
-    )
-
-
 def make_params(size: int, seed: int = 42) -> jnp.ndarray:
     """Return Robertson rate constants with +/-10% uniform perturbation."""
     rng = np.random.default_rng(seed)
