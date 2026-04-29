@@ -3,9 +3,15 @@
 import jax.numpy as jnp
 import numpy as np
 
-N_VARS = 3
-Y0 = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float64)
 TIMES = jnp.array((0.0, 1e-6, 1e-2, 1e2, 1e5), dtype=jnp.float64)
+
+ALPHA = 0.99
+EPS = 0.1
+Y0 = jnp.array([(1 - EPS) * ALPHA, EPS, (1 - EPS) * (1 - ALPHA)], dtype=np.float64)
+N_VARS = 3
+
+PARAMS = jnp.array([0.04, 1e4, 3e7], dtype=jnp.float64)
+N_PARAMS = 3
 
 
 def ode_fn(y, t, p):
@@ -22,8 +28,38 @@ def ode_fn(y, t, p):
 def make_params(size: int, seed: int = 42) -> jnp.ndarray:
     """Return Robertson rate constants with +/-10% uniform perturbation."""
     rng = np.random.default_rng(seed)
-    base = np.array([0.04, 1e4, 3e7])
     return jnp.array(
-        base * (1.0 + 0.1 * (2.0 * rng.random((size, 3)) - 1.0)),
+        PARAMS * (1.0 + 0.1 * (2.0 * rng.random((size, N_PARAMS)) - 1.0)),
         dtype=jnp.float64,
     )
+
+
+def make_initial_conditions(size: int, seed: int = 42) -> jnp.ndarray:
+    """ICs are parameterised by (alpha, epsilon):
+
+        y(0) = [(1-eps)*alpha,  eps,  (1-eps)*(1-alpha)]
+
+    where eps controls how much of the intermediate species y2 is present at
+    t=0 and alpha distributes the remaining mass between fuel (y1) and product
+    (y3).
+
+      * eps > 0 forces the solver to resolve the fastest reaction timescale
+        immediately: dy3/dt = k3*eps^2 is large at t=0, so the first step must
+        be tiny and the Newton iteration may reject steps before settling onto
+        the slow manifold.  The standard [1,0,0] IC has eps=0 and a long
+        induction period where only the slow k1=0.04 rate is active.
+
+      * alpha controls how long the stiff phase lasts: high alpha means plenty
+        of y1 fuel to keep the reactions running, extending the hard region of
+        the trajectory.
+    """
+    rng = np.random.default_rng(seed)
+    alpha = rng.uniform(0.0, ALPHA, size)
+    y0 = np.column_stack(
+        [
+            (1 - EPS) * alpha,
+            np.full(size, EPS),
+            (1 - EPS) * (1 - alpha),
+        ]
+    )
+    return y0

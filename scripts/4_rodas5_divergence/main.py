@@ -6,23 +6,7 @@ while-loop batch.
 
 Initial condition design
 ------------------------
-ICs are parameterised by (alpha, epsilon):
 
-    y(0) = [(1-eps)*alpha,  eps,  (1-eps)*(1-alpha)]
-
-where eps controls how much of the intermediate species y2 is present at
-t=0 and alpha distributes the remaining mass between fuel (y1) and product
-(y3).
-
-  * eps > 0 forces the solver to resolve the fastest reaction timescale
-    immediately: dy3/dt = k3*eps^2 is large at t=0, so the first step must
-    be tiny and the Newton iteration may reject steps before settling onto
-    the slow manifold.  The standard [1,0,0] IC has eps=0 and a long
-    induction period where only the slow k1=0.04 rate is active.
-
-  * alpha controls how long the stiff phase lasts: high alpha means plenty
-    of y1 fuel to keep the reactions running, extending the hard region of
-    the trajectory.
 
 The identical scenario pins (alpha=0.9, eps=0.1) for every trajectory,
 giving the hardest representative IC.
@@ -75,15 +59,12 @@ _SOLVER_KWARGS = {
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _CACHE_PATH = _SCRIPT_DIR / "results.json"
 
-_PARAMS = jnp.array([0.04, 1e4, 3e7], dtype=jnp.float64)
-
 
 @dataclass(frozen=True)
 class Scenario:
     key: str
     label: str
     color: str
-    params: jnp.ndarray
 
 
 @dataclass(frozen=True)
@@ -94,16 +75,9 @@ class Grouping:
     marker: str
 
 
-_IC_ALPHA_HARD = 0.99
-_IC_EPS = 0.1
-_HARD_Y0 = np.array(
-    [(1 - _IC_EPS) * _IC_ALPHA_HARD, _IC_EPS, (1 - _IC_EPS) * (1 - _IC_ALPHA_HARD)],
-    dtype=np.float64,
-)
-
 _SCENARIOS = (
-    Scenario("identical", "identical", "#2b7be0", _PARAMS),
-    Scenario("ic_large", "large y0", "#e02b2b", _PARAMS),
+    Scenario("identical", "identical", "#2b7be0"),
+    Scenario("ic_large", "large y0", "#e02b2b"),
 )
 
 _GROUPINGS = (
@@ -124,16 +98,17 @@ _CSV_FIELDS = (
 )
 
 
-def make_initial_conditions(
+def make_scenario_data(
     scenario: Scenario, size: int, seed: int = 42
-) -> np.ndarray:
+) -> tuple[np.ndarray, jnp.ndarray]:
     if scenario.key == "identical":
-        return np.broadcast_to(_HARD_Y0, (size, robertson.N_VARS)).copy()
-    rng = np.random.default_rng(seed)
-    alpha = rng.uniform(0.0, _IC_ALPHA_HARD, size)
-    return np.column_stack(
-        [(1 - _IC_EPS) * alpha, np.full(size, _IC_EPS), (1 - _IC_EPS) * (1 - alpha)]
-    )
+        y0 = np.broadcast_to(robertson.Y0, (size, robertson.N_VARS)).copy()
+        params = np.broadcast_to(robertson.PARAMS, (size, robertson.N_PARAMS)).copy()
+    else:
+        params = robertson.make_params(size, seed)
+        y0 = robertson.make_initial_conditions(size, seed)
+
+    return y0, params
 
 
 def summarize_stats(stats: dict) -> dict[str, float | int]:
@@ -198,14 +173,16 @@ def active_attempt_order(y0: np.ndarray, params: jnp.ndarray) -> np.ndarray:
     return np.argsort(attempts, kind="stable")
 
 
-def order_initial_conditions(
-    y0: np.ndarray, scenario: Scenario, grouping: Grouping
-) -> np.ndarray:
+def order_scenario_data(
+    y0: np.ndarray, params: jnp.ndarray, scenario: Scenario, grouping: Grouping
+) -> tuple[np.ndarray, jnp.ndarray]:
     if grouping.key == "sorted":
-        return y0[active_attempt_order(y0, scenario.params)]
+        order = active_attempt_order(y0, params)
+        return y0[order], params[order]
     seed = sum(ord(c) for c in f"{scenario.key}:{grouping.key}")
     rng = np.random.default_rng(seed)
-    return y0[rng.permutation(y0.shape[0])]
+    perm = rng.permutation(y0.shape[0])
+    return y0[perm], params[perm]
 
 
 def is_complete_row(value) -> bool:
@@ -225,6 +202,7 @@ def collect_row(
     scenario: Scenario,
     grouping: Grouping,
     y0: np.ndarray,
+    params: jnp.ndarray,
     batch_size: int,
 ) -> dict | None:
     print(
@@ -233,7 +211,7 @@ def collect_row(
         flush=True,
     )
     try:
-        ms, stats = time_solve_with_stats(y0, scenario.params, batch_size)
+        ms, stats = time_solve_with_stats(y0, params, batch_size)
     except Exception as exc:
         print(f"FAILED ({exc})")
         return None
@@ -252,10 +230,10 @@ def run_benchmarks(gpu_name: str, cache: dict) -> list[dict]:
     gpu_cache = cache.setdefault(gpu_name, {})
     rows: list[dict] = []
     for scenario, grouping in iter_cases():
-        base_y0 = make_initial_conditions(scenario, _N_TRAJ)
+        base_y0, base_params = make_scenario_data(scenario, _N_TRAJ)
         case_key = f"{scenario.key}_{grouping.key}"
         case_cache = gpu_cache.setdefault(case_key, {})
-        y0 = order_initial_conditions(base_y0, scenario, grouping)
+        y0, params = order_scenario_data(base_y0, base_params, scenario, grouping)
         print(f"{scenario.label} / {grouping.label}:")
         for bs in _BATCH_SIZES:
             bs_key = str(int(bs))
@@ -268,7 +246,7 @@ def run_benchmarks(gpu_name: str, cache: dict) -> list[dict]:
                     f"{format_stats(row)}"
                 )
             else:
-                row = collect_row(gpu_name, scenario, grouping, y0, int(bs))
+                row = collect_row(gpu_name, scenario, grouping, y0, params, int(bs))
                 case_cache[bs_key] = row
                 save_cache(_CACHE_PATH, cache)
             if row is not None:
@@ -337,7 +315,9 @@ def plot(rows: list[dict], gpu_name: str, output_path: Path) -> None:
     ax_time.set_ylabel("Solve time (ms)")
     ax_waste.set_ylabel("Wasted lane-iteration ratio")
     ax_waste.set_ylim(0.0, 1.0)
-    ax_time.set_title(f"Rodas5 divergence - Robertson y0 variation - {gpu_name}")
+    ax_time.set_title(
+        f"Rodas5 divergence - Robertson y0 + params variation - {gpu_name}"
+    )
     ax_time.grid(True, which="both", linestyle="--", alpha=0.35)
     ax_time.set_xticks(_BATCH_SIZES)
     ax_time.set_xticklabels([str(bs) for bs in _BATCH_SIZES], rotation=45, ha="right")
