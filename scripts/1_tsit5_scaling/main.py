@@ -10,10 +10,7 @@ Usage:
 """
 
 import csv
-import json
-import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -27,6 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from reference.solvers.python.diffrax_tsit5 import solve as diffrax_tsit5_solve
 from reference.solvers.python.julia_tsit5 import solve as julia_tsit5_solve
 from reference.systems.python import lorenz
+from scripts.benchmark_common import (
+    get_gpu_name,
+    load_cache,
+    output_paths,
+    save_cache,
+    time_blocked,
+)
 from solvers.tsit5 import solve as tsit5_solve
 
 jax.config.update("jax_enable_x64", True)
@@ -66,44 +70,6 @@ class SolverSpec:
     timing_fn: Callable[[object], float]
 
 
-def get_gpu_name() -> str:
-    try:
-        out = (
-            subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                text=True,
-            )
-            .strip()
-            .splitlines()[0]
-            .strip()
-        )
-        if out:
-            return out
-    except Exception:
-        pass
-    try:
-        devices = jax.devices("gpu")
-        if devices:
-            return devices[0].device_kind
-    except Exception:
-        pass
-    return "unknown_GPU"
-
-
-def gpu_slug(name: str) -> str:
-    return name.replace(" ", "_").replace("/", "-")
-
-
-def load_cache() -> dict:
-    if _CACHE_PATH.exists():
-        return json.loads(_CACHE_PATH.read_text())
-    return {}
-
-
-def save_cache(cache: dict) -> None:
-    _CACHE_PATH.write_text(json.dumps(cache, indent=2))
-
-
 def time_jax_solver(solve_fn, params) -> float:
     def run():
         return solve_fn(
@@ -112,13 +78,10 @@ def time_jax_solver(solve_fn, params) -> float:
             t_span=_T_SPAN,
             params=params,
             **_SOLVER_KWARGS,
-        ).block_until_ready()
+        )
 
-    run()  # warmup / JIT compile
-    t0 = time.perf_counter()
-    for _ in range(_N_RUNS):
-        run()
-    return (time.perf_counter() - t0) / _N_RUNS * 1000
+    ms, _ = time_blocked(run, _N_RUNS)
+    return ms
 
 
 def time_julia_solver(solve, params, *, ensemble_backend: str) -> float:
@@ -191,9 +154,7 @@ def drop_none(
     return list(sizes), list(times)
 
 
-def run_benchmarks(
-    specs: list[SolverSpec], gpu_name: str, cache: dict
-) -> list[_Row]:
+def run_benchmarks(specs: list[SolverSpec], gpu_name: str, cache: dict) -> list[_Row]:
     gpu_cache = cache.setdefault(gpu_name, {})
     rows: list[_Row] = []
     for spec in specs:
@@ -203,12 +164,14 @@ def run_benchmarks(
             size_key = str(size)
             if size_key in solver_cache:
                 ms = solver_cache[size_key]
-                print(f"  {spec.label:<20} n={size:>7} ... (cached) {f'{ms:.1f} ms' if ms is not None else 'FAILED'}")
+                print(
+                    f"  {spec.label:<20} n={size:>7} ... (cached) {f'{ms:.1f} ms' if ms is not None else 'FAILED'}"
+                )
             else:
                 params = lorenz.make_params(size)
                 ms = collect_timing(spec, size, params)
                 solver_cache[size_key] = ms
-                save_cache(cache)
+                save_cache(_CACHE_PATH, cache)
             rows.append((spec.key, spec.label, size, ms))
         print()
     return rows
@@ -220,7 +183,6 @@ def save_csv(rows: list[_Row], path: Path) -> None:
         writer.writerow(["solver_key", "solver", "ensemble_size", "solve_time_ms"])
         writer.writerows(rows)
     print(f"Results saved to {path}")
-
 
 
 def plot(
@@ -255,17 +217,14 @@ def plot(
 
 def main() -> None:
     gpu_name = get_gpu_name()
-    slug = gpu_slug(gpu_name)
     print(f"GPU: {gpu_name}\n")
 
-    cache = load_cache()
+    cache = load_cache(_CACHE_PATH)
     specs = make_solver_specs()
     rows = run_benchmarks(specs, gpu_name, cache)
 
-    csv_path = _SCRIPT_DIR / f"results-{slug}.csv"
+    csv_path, plot_path = output_paths(_SCRIPT_DIR, gpu_name)
     save_csv(rows, csv_path)
-
-    plot_path = _SCRIPT_DIR / f"plot-{slug}.png"
     plot(rows, specs, gpu_name, plot_path)
 
 

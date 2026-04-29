@@ -32,10 +32,7 @@ Usage:
 """
 
 import csv
-import json
-import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +44,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from reference.systems.python import lorenz
+from scripts.benchmark_common import (
+    get_gpu_name,
+    load_cache,
+    output_paths,
+    save_cache,
+    time_blocked,
+)
 from solvers.tsit5 import solve as tsit5_solve
 
 jax.config.update("jax_enable_x64", True)
@@ -100,44 +104,6 @@ _CSV_FIELDS = (
     "max_batch_loop_iterations",
     "wasted_lane_iteration_ratio",
 )
-
-
-def get_gpu_name() -> str:
-    try:
-        out = (
-            subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                text=True,
-            )
-            .strip()
-            .splitlines()[0]
-            .strip()
-        )
-        if out:
-            return out
-    except Exception:
-        pass
-    try:
-        devices = jax.devices("gpu")
-        if devices:
-            return devices[0].device_kind
-    except Exception:
-        pass
-    return "unknown_GPU"
-
-
-def gpu_slug(name: str) -> str:
-    return name.replace(" ", "_").replace("/", "-")
-
-
-def load_cache() -> dict:
-    if _CACHE_PATH.exists():
-        return json.loads(_CACHE_PATH.read_text())
-    return {}
-
-
-def save_cache(cache: dict) -> None:
-    _CACHE_PATH.write_text(json.dumps(cache, indent=2))
 
 
 _HARD_Y0 = np.array([1000.0, -500.0, 500.0], dtype=np.float64)
@@ -199,14 +165,7 @@ def solve_with_stats(y0: np.ndarray, batch_size: int | None):
 
 
 def time_solve_with_stats(y0: np.ndarray, batch_size: int | None) -> tuple[float, dict]:
-    result = solve_with_stats(y0, batch_size)
-    jax.block_until_ready(result)
-
-    t0 = time.perf_counter()
-    for _ in range(_N_RUNS):
-        result = solve_with_stats(y0, batch_size)
-        jax.block_until_ready(result)
-    ms = (time.perf_counter() - t0) / _N_RUNS * 1000
+    ms, result = time_blocked(lambda: solve_with_stats(y0, batch_size), _N_RUNS)
     _, stats = result
     return ms, summarize_stats(stats)
 
@@ -292,7 +251,7 @@ def run_benchmarks(gpu_name: str, cache: dict) -> list[dict]:
             else:
                 row = collect_row(gpu_name, scenario, grouping, y0, int(bs))
                 case_cache[bs_key] = row
-                save_cache(cache)
+                save_cache(_CACHE_PATH, cache)
             if row is not None:
                 rows.append(row)
         print()
@@ -373,16 +332,13 @@ def plot(rows: list[dict], gpu_name: str, output_path: Path) -> None:
 
 def main() -> None:
     gpu_name = get_gpu_name()
-    slug = gpu_slug(gpu_name)
     print(f"GPU: {gpu_name}\n")
 
-    cache = load_cache()
+    cache = load_cache(_CACHE_PATH)
     rows = run_benchmarks(gpu_name, cache)
 
-    csv_path = _SCRIPT_DIR / f"results-{slug}.csv"
+    csv_path, plot_path = output_paths(_SCRIPT_DIR, gpu_name)
     save_csv(rows, csv_path)
-
-    plot_path = _SCRIPT_DIR / f"plot-{slug}.png"
     plot(rows, gpu_name, plot_path)
 
 
