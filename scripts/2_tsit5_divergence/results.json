@@ -236,6 +236,7 @@
         "max_batch_loop_iterations": 726,
         "wasted_lane_iteration_ratio": 0.4315469834710744
       }
-    }
+    },
+    "julia_tsit5_EnsembleGPUKernel": 1556.92363
   }
 }

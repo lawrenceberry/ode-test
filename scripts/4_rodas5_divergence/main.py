@@ -32,6 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from reference.solvers.python.julia_rodas5 import solve as julia_rodas5_solve
 from reference.systems.python import robertson
 from scripts.benchmark_common import (
     get_gpu_name,
@@ -57,6 +58,10 @@ _SOLVER_KWARGS = {
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _CACHE_PATH = _SCRIPT_DIR / "results.json"
+
+_JULIA_KERNEL_CACHE_KEY = "julia_rodas5_EnsembleGPUKernel"
+_JULIA_KERNEL_COLOR = "#9b59b6"
+_JULIA_KERNEL_LABEL = "Julia Rodas5 kernel (N=400k, 0% waste)"
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,22 @@ def order_scenario_data(
     return y0[perm], params[perm]
 
 
+_JULIA_SOLVER_KWARGS = {k: v for k, v in _SOLVER_KWARGS.items() if k != "lu_precision"}
+
+
+def time_julia_kernel() -> float:
+    _, params = robertson.make_scenario("divergent", _N_TRAJ)
+    result = julia_rodas5_solve._julia_solve_with_timing(
+        "robertson",
+        robertson.Y0,
+        _T_SPAN,
+        np.asarray(params),
+        ensemble_backend="EnsembleGPUKernel",
+        **_JULIA_SOLVER_KWARGS,
+    )
+    return result.solve_time_s * 1000
+
+
 def is_complete_row(value) -> bool:
     return isinstance(value, dict) and all(field in value for field in _CSV_FIELDS)
 
@@ -212,7 +233,7 @@ def collect_row(
     return row
 
 
-def run_benchmarks(gpu_name: str, cache: dict) -> list[dict]:
+def run_benchmarks(gpu_name: str, cache: dict) -> tuple[list[dict], float | None]:
     gpu_cache = cache.setdefault(gpu_name, {})
     rows: list[dict] = []
     for scenario, grouping in iter_cases():
@@ -238,7 +259,19 @@ def run_benchmarks(gpu_name: str, cache: dict) -> list[dict]:
             if row is not None:
                 rows.append(row)
         print()
-    return rows
+    julia_ms: float | None = gpu_cache.get(_JULIA_KERNEL_CACHE_KEY)
+    if julia_ms is None:
+        print(f"Julia Rodas5 kernel (N={_N_TRAJ}) ...", end=" ", flush=True)
+        try:
+            julia_ms = time_julia_kernel()
+            print(f"{julia_ms:.1f} ms")
+            gpu_cache[_JULIA_KERNEL_CACHE_KEY] = julia_ms
+            save_cache(_CACHE_PATH, cache)
+        except Exception as exc:
+            print(f"FAILED ({exc})")
+    else:
+        print(f"Julia Rodas5 kernel (N={_N_TRAJ}) ... (cached) {julia_ms:.1f} ms")
+    return rows, julia_ms
 
 
 def save_csv(rows: list[dict], path: Path) -> None:
@@ -263,7 +296,9 @@ def rows_for_case(
     )
 
 
-def plot(rows: list[dict], gpu_name: str, output_path: Path) -> None:
+def plot(
+    rows: list[dict], gpu_name: str, output_path: Path, julia_ms: float | None = None
+) -> None:
     fig, ax_time = plt.subplots(figsize=(11, 6))
     ax_waste = ax_time.twinx()
 
@@ -294,6 +329,15 @@ def plot(rows: list[dict], gpu_name: str, output_path: Path) -> None:
         )
         time_handles.append(time_line)
         waste_handles.append(waste_line)
+    if julia_ms is not None:
+        julia_line = ax_time.axhline(
+            julia_ms,
+            color=_JULIA_KERNEL_COLOR,
+            linestyle="--",
+            linewidth=1.5,
+            label=_JULIA_KERNEL_LABEL,
+        )
+        time_handles.append(julia_line)
 
     ax_time.set_xscale("log")
     ax_time.set_yscale("log")
@@ -320,11 +364,11 @@ def main() -> None:
     print(f"GPU: {gpu_name}\n")
 
     cache = load_cache(_CACHE_PATH)
-    rows = run_benchmarks(gpu_name, cache)
+    rows, julia_ms = run_benchmarks(gpu_name, cache)
 
     csv_path, plot_path = output_paths(_SCRIPT_DIR, gpu_name)
     save_csv(rows, csv_path)
-    plot(rows, gpu_name, plot_path)
+    plot(rows, gpu_name, plot_path, julia_ms=julia_ms)
 
 
 if __name__ == "__main__":

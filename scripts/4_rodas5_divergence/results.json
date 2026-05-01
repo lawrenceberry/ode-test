@@ -203,6 +203,7 @@
         "max_batch_loop_iterations": 140,
         "wasted_lane_iteration_ratio": 0.2499869642857143
       }
-    }
+    },
+    "julia_rodas5_EnsembleGPUKernel": 1963.422155
   }
 }
