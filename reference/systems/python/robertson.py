@@ -2,6 +2,8 @@
 
 import jax.numpy as jnp
 import numpy as np
+import warp as wp
+from numba import cuda
 
 TIMES = jnp.array((0.0, 1e-6, 1e-2, 1e2, 1e5), dtype=jnp.float64)
 
@@ -23,6 +25,66 @@ def ode_fn(y, t, p):
             p[2] * y[1] ** 2,
         ]
     )
+
+
+def ode_fn_pallas(y, t, p):
+    del t
+    dy0 = -p[:, 0] * y[:, 0] + p[:, 1] * y[:, 1] * y[:, 2]
+    dy1 = p[:, 0] * y[:, 0] - p[:, 1] * y[:, 1] * y[:, 2] - p[:, 2] * y[:, 1] ** 2
+    dy2 = p[:, 2] * y[:, 1] ** 2
+    return dy0, dy1, dy2, dy0 * 0.0  # padded to n_vars_work=4
+
+
+@cuda.jit(device=True)
+def ode_fn_numba_cuda(y, t, p, dy, i):
+    dy[i, 0] = -p[i, 0] * y[i, 0] + p[i, 1] * y[i, 1] * y[i, 2]
+    dy[i, 1] = p[i, 0] * y[i, 0] - p[i, 1] * y[i, 1] * y[i, 2] - p[i, 2] * y[i, 1] ** 2
+    dy[i, 2] = p[i, 2] * y[i, 1] ** 2
+
+
+@cuda.jit(device=True)
+def jac_fn_numba_cuda(y, t, p, jac, i):
+    jac[i, 0, 0] = -p[i, 0]
+    jac[i, 0, 1] = p[i, 1] * y[i, 2]
+    jac[i, 0, 2] = p[i, 1] * y[i, 1]
+    jac[i, 1, 0] = p[i, 0]
+    jac[i, 1, 1] = -p[i, 1] * y[i, 2] - 2.0 * p[i, 2] * y[i, 1]
+    jac[i, 1, 2] = -p[i, 1] * y[i, 1]
+    jac[i, 2, 0] = 0.0
+    jac[i, 2, 1] = 2.0 * p[i, 2] * y[i, 1]
+    jac[i, 2, 2] = 0.0
+
+
+@wp.func
+def ode_fn_warp(
+    y: wp.array2d(dtype=wp.float64),
+    t: wp.float64,
+    p: wp.array2d(dtype=wp.float64),
+    dy: wp.array2d(dtype=wp.float64),
+    i: wp.int32,
+):
+    dy[i, 0] = -p[i, 0] * y[i, 0] + p[i, 1] * y[i, 1] * y[i, 2]
+    dy[i, 1] = p[i, 0] * y[i, 0] - p[i, 1] * y[i, 1] * y[i, 2] - p[i, 2] * y[i, 1] * y[i, 1]
+    dy[i, 2] = p[i, 2] * y[i, 1] * y[i, 1]
+
+
+@wp.func
+def jac_fn_warp(
+    y: wp.array2d(dtype=wp.float64),
+    t: wp.float64,
+    p: wp.array2d(dtype=wp.float64),
+    jac: wp.array3d(dtype=wp.float64),
+    i: wp.int32,
+):
+    jac[i, 0, 0] = -p[i, 0]
+    jac[i, 0, 1] = p[i, 1] * y[i, 2]
+    jac[i, 0, 2] = p[i, 1] * y[i, 1]
+    jac[i, 1, 0] = p[i, 0]
+    jac[i, 1, 1] = -p[i, 1] * y[i, 2] - wp.float64(2.0) * p[i, 2] * y[i, 1]
+    jac[i, 1, 2] = -p[i, 1] * y[i, 1]
+    jac[i, 2, 0] = wp.float64(0.0)
+    jac[i, 2, 1] = wp.float64(2.0) * p[i, 2] * y[i, 1]
+    jac[i, 2, 2] = wp.float64(0.0)
 
 
 def make_params(size: int, seed: int = 42) -> jnp.ndarray:
