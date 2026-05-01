@@ -161,9 +161,7 @@ def solve(
 
     def _solve_one(params_one, y0_one):
         y_init = y0_one.copy()
-        hist_init = (
-            jnp.zeros((n_save, n_vars), dtype=jnp.float64).at[0, :].set(y_init)
-        )
+        hist_init = jnp.zeros((n_save, n_vars), dtype=jnp.float64).at[0, :].set(y_init)
         t_init = times[0]
         dt_init = dt0
         save_idx_init = jnp.int32(1)

@@ -129,4 +129,3 @@ def test_julia_rodas5(benchmark, ensemble_size, ensemble_backend):
     )
     assert results_np.shape == (ensemble_size, len(_TIMES), robertson.N_VARS)
     np.testing.assert_allclose(results_np.sum(axis=2), 1.0, atol=1e-6)
-

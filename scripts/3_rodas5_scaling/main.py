@@ -137,7 +137,9 @@ def make_solver_specs() -> list[SolverSpec]:
             color=color,
             marker=marker,
             linestyle="-",
-            timing_fn=lambda y0, params, fn=fn: time_reference_jax_solver(fn, y0, params),
+            timing_fn=lambda y0, params, fn=fn: time_reference_jax_solver(
+                fn, y0, params
+            ),
         )
         for key, label, color, marker, fn in _JAX_SOLVER_DEFS
     )

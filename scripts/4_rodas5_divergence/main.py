@@ -96,7 +96,6 @@ _CSV_FIELDS = (
 )
 
 
-
 def summarize_stats(stats: dict) -> dict[str, float | int]:
     accepted_steps = np.asarray(jax.device_get(stats["accepted_steps"]))
     rejected_steps = np.asarray(jax.device_get(stats["rejected_steps"]))
