@@ -37,9 +37,9 @@ end
 
 function make_ensemble_algorithm(ensemble_backend::String)
     if ensemble_backend == "EnsembleGPUArray"
-        return EnsembleGPUArray(CUDA.CUDABackend())
+        return EnsembleGPUArray(CUDA.CUDABackend(), 0.0)
     elseif ensemble_backend == "EnsembleGPUKernel"
-        return EnsembleGPUKernel(CUDA.CUDABackend())
+        return EnsembleGPUKernel(CUDA.CUDABackend(), 0.0)
     end
     error("Unknown ensemble backend '$ensemble_backend'")
 end
