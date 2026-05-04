@@ -35,6 +35,7 @@ from scripts.benchmark_common import (
     save_cache,
 )
 from solvers.rodas5 import solve as rodas5_solve
+from solvers.rodas5ckno import solve as rodas5ckno_solve
 from solvers.rodas5cknp import (
     prepare_solve as rodas5cknp_prepare_solve,
 )
@@ -70,6 +71,7 @@ _COLORS = {
     "rodas5": "#7b3fb2",
     "rodas5ckp": "#2b7be0",
     "rodas5ckw": "#e02b2b",
+    "rodas5ckno": "#7a8b99",
     "rodas5cknp": "#2ba84a",
     "rodas5ckns": "#f0a202",
 }
@@ -241,6 +243,9 @@ _SOLVERS = (
     SolverSpec("rodas5", "pure JAX rodas5.py", rodas5_solve, kind="jax"),
     SolverSpec("rodas5ckp", "Pallas/Triton", rodas5ckp_solve, kind="pallas"),
     SolverSpec("rodas5ckw", "NVIDIA Warp", rodas5ckw_solve, kind="custom_kernel"),
+    SolverSpec(
+        "rodas5ckno", "numba-cuda original", rodas5ckno_solve, kind="custom_kernel"
+    ),
     SolverSpec(
         "rodas5cknp", "numba-cuda packed", rodas5cknp_solve, kind="custom_kernel"
     ),
