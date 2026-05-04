@@ -35,7 +35,24 @@ from scripts.benchmark_common import (
     save_cache,
 )
 from solvers.rodas5 import solve as rodas5_solve
-from solvers.rodas5ckn import solve as rodas5ckn_solve
+from solvers.rodas5cknp import (
+    prepare_solve as rodas5cknp_prepare_solve,
+)
+from solvers.rodas5cknp import (
+    run_prepared as rodas5cknp_run_prepared,
+)
+from solvers.rodas5cknp import (
+    solve as rodas5cknp_solve,
+)
+from solvers.rodas5ckns import (
+    prepare_solve as rodas5ckns_prepare_solve,
+)
+from solvers.rodas5ckns import (
+    run_prepared as rodas5ckns_run_prepared,
+)
+from solvers.rodas5ckns import (
+    solve as rodas5ckns_solve,
+)
 from solvers.rodas5ckp import solve as rodas5ckp_solve
 from solvers.rodas5ckw import solve as rodas5ckw_solve
 
@@ -53,7 +70,8 @@ _COLORS = {
     "rodas5": "#7b3fb2",
     "rodas5ckp": "#2b7be0",
     "rodas5ckw": "#e02b2b",
-    "rodas5ckn": "#2ba84a",
+    "rodas5cknp": "#2ba84a",
+    "rodas5ckns": "#f0a202",
 }
 
 _MU = 100.0
@@ -64,6 +82,7 @@ _OMEGA = 1.0
 # ---------------------------------------------------------------------------
 # Pallas backend — factory that captures n_osc in a closure
 # ---------------------------------------------------------------------------
+
 
 def make_vdp_ode_fn_pallas(n_osc: int) -> Callable:
     """Return a Pallas-compatible ode_fn for n_osc coupled VdP oscillators.
@@ -86,9 +105,7 @@ def make_vdp_ode_fn_pallas(n_osc: int) -> Callable:
             lap = xs[kp1] - 2.0 * xs[k] + xs[km1]
             result.append(vs[k])
             result.append(
-                scale * MU * (1.0 - xs[k] ** 2) * vs[k]
-                - OMEGA ** 2 * xs[k]
-                + D * lap
+                scale * MU * (1.0 - xs[k] ** 2) * vs[k] - OMEGA**2 * xs[k] + D * lap
             )
         return tuple(result)
 
@@ -98,6 +115,7 @@ def make_vdp_ode_fn_pallas(n_osc: int) -> Callable:
 # ---------------------------------------------------------------------------
 # Warp backend — module-level @wp.func; n_osc read from params[:, 0]
 # ---------------------------------------------------------------------------
+
 
 @wp.func
 def ode_fn_vdp_warp(
@@ -118,9 +136,7 @@ def ode_fn_vdp_warp(
         vk = y[i, 2 * k + 1]
         lap = y[i, 2 * kp1] - wp.float64(2.0) * xk + y[i, 2 * km1]
         dy[i, 2 * k] = vk
-        dy[i, 2 * k + 1] = (
-            scale * MU * (wp.float64(1.0) - xk * xk) * vk - xk + D * lap
-        )
+        dy[i, 2 * k + 1] = scale * MU * (wp.float64(1.0) - xk * xk) * vk - xk + D * lap
 
 
 @wp.func
@@ -165,6 +181,7 @@ def jac_fn_vdp_warp(
 # ---------------------------------------------------------------------------
 # numba-cuda backend — module-level @cuda.jit(device=True)
 # ---------------------------------------------------------------------------
+
 
 @cuda.jit(device=True)
 def ode_fn_vdp_numba(y, t, p, dy, i):
@@ -211,6 +228,7 @@ def jac_fn_vdp_numba(y, t, p, jac, i):
 # Solver specs and input construction
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class SolverSpec:
     key: str
@@ -223,7 +241,12 @@ _SOLVERS = (
     SolverSpec("rodas5", "pure JAX rodas5.py", rodas5_solve, kind="jax"),
     SolverSpec("rodas5ckp", "Pallas/Triton", rodas5ckp_solve, kind="pallas"),
     SolverSpec("rodas5ckw", "NVIDIA Warp", rodas5ckw_solve, kind="custom_kernel"),
-    SolverSpec("rodas5ckn", "numba-cuda", rodas5ckn_solve, kind="custom_kernel"),
+    SolverSpec(
+        "rodas5cknp", "numba-cuda packed", rodas5cknp_solve, kind="custom_kernel"
+    ),
+    SolverSpec(
+        "rodas5ckns", "numba-cuda single", rodas5ckns_solve, kind="custom_kernel"
+    ),
 )
 
 
@@ -242,10 +265,12 @@ def make_inputs(spec: SolverSpec, dim: int):
         params = jnp.ones((_N_TRAJ, 1), dtype=jnp.float64)
         return ode_fn, None, jnp.asarray(y0_np), params
 
-    params_np = np.column_stack([
-        np.full(_N_TRAJ, float(n_osc), dtype=np.float64),
-        np.ones(_N_TRAJ, dtype=np.float64),
-    ])
+    params_np = np.column_stack(
+        [
+            np.full(_N_TRAJ, float(n_osc), dtype=np.float64),
+            np.ones(_N_TRAJ, dtype=np.float64),
+        ]
+    )
     if spec.key == "rodas5ckw":
         return ode_fn_vdp_warp, jac_fn_vdp_warp, y0_np, params_np
     return ode_fn_vdp_numba, jac_fn_vdp_numba, y0_np, params_np
@@ -253,13 +278,18 @@ def make_inputs(spec: SolverSpec, dim: int):
 
 def run_solver(spec: SolverSpec, ode_fn, jac_fn, y0, params):
     if spec.kind in ("jax", "pallas"):
-        return spec.solve_fn(ode_fn, y0=y0, t_span=_T_SPAN, params=params, **_SOLVER_KWARGS)
-    return spec.solve_fn(ode_fn, jac_fn, y0=y0, t_span=_T_SPAN, params=params, **_SOLVER_KWARGS)
+        return spec.solve_fn(
+            ode_fn, y0=y0, t_span=_T_SPAN, params=params, **_SOLVER_KWARGS
+        )
+    return spec.solve_fn(
+        ode_fn, jac_fn, y0=y0, t_span=_T_SPAN, params=params, **_SOLVER_KWARGS
+    )
 
 
 # ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
+
 
 def block_until_ready(value) -> None:
     if isinstance(value, jax.Array):
@@ -301,8 +331,36 @@ def collect_timing(
     try:
         ode_fn, jac_fn, y0, params = make_inputs(spec, dim)
 
-        def run():
-            return run_solver(spec, ode_fn, jac_fn, y0, params)
+        if spec.key == "rodas5cknp":
+            prepared = rodas5cknp_prepare_solve(
+                ode_fn,
+                jac_fn,
+                y0=y0,
+                t_span=_T_SPAN,
+                params=params,
+                **_SOLVER_KWARGS,
+            )
+
+            def run():
+                return rodas5cknp_run_prepared(prepared, copy_solution=False)
+
+        elif spec.key == "rodas5ckns":
+            prepared = rodas5ckns_prepare_solve(
+                ode_fn,
+                jac_fn,
+                y0=y0,
+                t_span=_T_SPAN,
+                params=params,
+                **_SOLVER_KWARGS,
+            )
+
+            def run():
+                return rodas5ckns_run_prepared(prepared, copy_solution=False)
+
+        else:
+
+            def run():
+                return run_solver(spec, ode_fn, jac_fn, y0, params)
 
         compile_ms, solve_ms = time_with_compile(run, _N_RUNS)
     except Exception as exc:
@@ -346,6 +404,7 @@ def run_benchmarks(gpu_name: str, cache: dict) -> list[_Row]:
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+
 
 def save_csv(rows: list[_Row], gpu_name: str, path: Path) -> None:
     with path.open("w", newline="") as f:
