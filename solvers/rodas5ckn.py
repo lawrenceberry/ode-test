@@ -7,12 +7,40 @@ import math
 
 import numpy as np
 from numba import cuda
+from nvmath.device import LUPivotSolver
 
 from solvers import _rodas5ck_common as ck
 
 
+def _as_launch_block_dim(block_dim):
+    if isinstance(block_dim, int):
+        return block_dim
+    if isinstance(block_dim, (tuple, list)):
+        return block_dim
+    x = getattr(block_dim, "x", None)
+    y = getattr(block_dim, "y", 1)
+    z = getattr(block_dim, "z", 1)
+    if x is not None:
+        return (int(x), int(y), int(z))
+    return 128
+
+
 @functools.cache
 def _make_kernel(ode_fn, jac_fn, n_vars: int):
+    lu_solver = LUPivotSolver(
+        size=(n_vars, n_vars, 1),
+        precision=np.float64,
+        execution="Block",
+        arrangement=("row_major", "row_major"),
+        batches_per_block="suggested",
+        block_dim="suggested",
+    )
+    batches_per_block = int(lu_solver.batches_per_block)
+    a_size = int(lu_solver.a_size())
+    b_size = int(lu_solver.b_size())
+    ipiv_size = int(lu_solver.ipiv_size)
+    print(f"Using {batches_per_block=} and {lu_solver.block_dim=} for LU solver.")
+
     @cuda.jit
     def kernel(
         y0,
@@ -37,318 +65,492 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
         k7,
         k8,
         jac,
-        lu_mat,
-        piv_arr,
     ):
-        i = cuda.grid(1)
-        if i >= y0.shape[0]:
-            return
-
-        for j in range(n_vars):
-            y[i, j] = y0[i, j]
-            hist[i, 0, j] = y0[i, j]
+        block_start = cuda.blockIdx.x * batches_per_block
+        tx = cuda.threadIdx.x
 
         n_save = times.shape[0]
-        t = times[0]
         tf = times[n_save - 1]
-        dt = dt0
-        save_idx = 1
-        n_steps = 0
-        accepted_steps = 0
-        rejected_steps = 0
 
-        while save_idx < n_save and t < tf and n_steps < max_steps:
-            next_target = times[save_idx]
-            dt_use = dt
-            if dt_use > next_target - t:
-                dt_use = next_target - t
-            if dt_use < 1e-30:
-                dt_use = 1e-30
-            inv_dt = 1.0 / dt_use
-            t_end = t + dt_use
+        smem_lu = cuda.shared.array(shape=a_size, dtype=np.float64)
+        smem_rhs = cuda.shared.array(shape=b_size, dtype=np.float64)
+        smem_ipiv = cuda.shared.array(shape=ipiv_size, dtype=np.int32)
+        smem_info = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
 
-            # Compute Jacobian at (y, t)
-            jac_fn(y, t, params, jac, i)
+        smem_t = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_dt = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_dt_use = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_inv_dt = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_t_end = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_next_target = cuda.shared.array(shape=batches_per_block, dtype=np.float64)
+        smem_save_idx = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
+        smem_n_steps = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
+        smem_accepted = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
+        smem_rejected = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
+        smem_continue = cuda.shared.array(shape=1, dtype=np.int32)
 
-            # Build M = (1/(gamma*dt)) * I - J and copy to lu_mat
-            dtgamma_inv = 1.0 / (dt_use * ck.GAMMA)
-            for row in range(n_vars):
-                for col in range(n_vars):
-                    if row == col:
-                        lu_mat[i, row, col] = dtgamma_inv - jac[i, row, col]
-                    else:
-                        lu_mat[i, row, col] = -jac[i, row, col]
+        if tx < batches_per_block:
+            i = block_start + tx
+            if i < y0.shape[0]:
+                for j in range(n_vars):
+                    y[i, j] = y0[i, j]
+                    hist[i, 0, j] = y0[i, j]
+                smem_t[tx] = times[0]
+                smem_dt[tx] = dt0
+                smem_save_idx[tx] = 1
+            else:
+                smem_t[tx] = tf
+                smem_dt[tx] = dt0
+                smem_save_idx[tx] = n_save
+            smem_n_steps[tx] = 0
+            smem_accepted[tx] = 0
+            smem_rejected[tx] = 0
 
-            # LU factorization with partial pivoting (in-place on lu_mat)
-            for k_lu in range(n_vars):
-                piv_k = k_lu
-                max_v = math.fabs(lu_mat[i, k_lu, k_lu])
-                for m in range(k_lu + 1, n_vars):
-                    v = math.fabs(lu_mat[i, m, k_lu])
-                    if v > max_v:
-                        max_v = v
-                        piv_k = m
-                piv_arr[i, k_lu] = piv_k
-                if piv_k != k_lu:
-                    for col in range(n_vars):
-                        tmp = lu_mat[i, k_lu, col]
-                        lu_mat[i, k_lu, col] = lu_mat[i, piv_k, col]
-                        lu_mat[i, piv_k, col] = tmp
-                for m in range(k_lu + 1, n_vars):
-                    fac = lu_mat[i, m, k_lu] / lu_mat[i, k_lu, k_lu]
-                    lu_mat[i, m, k_lu] = fac
-                    for col in range(k_lu + 1, n_vars):
-                        lu_mat[i, m, col] -= fac * lu_mat[i, k_lu, col]
+        if tx == 0:
+            smem_continue[0] = 1
+        cuda.syncthreads()
+
+        while smem_continue[0] != 0:
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                a_offset = batch * n_vars * n_vars
+                b_offset = batch * n_vars
+                if active:
+                    next_target = times[smem_save_idx[batch]]
+                    dt_use = smem_dt[batch]
+                    if dt_use > next_target - smem_t[batch]:
+                        dt_use = next_target - smem_t[batch]
+                    if dt_use < 1e-30:
+                        dt_use = 1e-30
+                    smem_next_target[batch] = next_target
+                    smem_dt_use[batch] = dt_use
+                    smem_inv_dt[batch] = 1.0 / dt_use
+                    smem_t_end[batch] = smem_t[batch] + dt_use
+
+                    jac_fn(y, smem_t[batch], params, jac, i)
+
+                    # Build M = (1/(gamma*dt)) * I - J in row-major shared memory.
+                    dtgamma_inv = 1.0 / (dt_use * ck.GAMMA)
+                    for row in range(n_vars):
+                        for col in range(n_vars):
+                            if row == col:
+                                smem_lu[a_offset + row * n_vars + col] = (
+                                    dtgamma_inv - jac[i, row, col]
+                                )
+                            else:
+                                smem_lu[a_offset + row * n_vars + col] = -jac[
+                                    i, row, col
+                                ]
+                else:
+                    for row in range(n_vars):
+                        for col in range(n_vars):
+                            if row == col:
+                                smem_lu[a_offset + row * n_vars + col] = 1.0
+                            else:
+                                smem_lu[a_offset + row * n_vars + col] = 0.0
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = 0.0
+            cuda.syncthreads()
+            lu_solver.factorize(smem_lu, smem_ipiv, smem_info)
+            cuda.syncthreads()
 
             # ---- Stage 1 ----
-            ode_fn(y, t, params, k1, i)
-            # No C correction for stage 1
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k1[i, k_lu]
-                    k1[i, k_lu] = k1[i, piv_k]
-                    k1[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k1[i, k_lu] -= lu_mat[i, k_lu, col] * k1[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k1[i, k_lu] -= lu_mat[i, k_lu, col] * k1[i, col]
-                k1[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                b_offset = batch * n_vars
+                if active:
+                    ode_fn(y, smem_t[batch], params, k1, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = k1[i, j]
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k1[i, j] = smem_rhs[b_offset + j]
 
             # ---- Stage 2 ----
-            for j in range(n_vars):
-                u[i, j] = y[i, j] + ck.A21 * k1[i, j]
-            ode_fn(u, t + ck.C2 * dt_use, params, k2, i)
-            for j in range(n_vars):
-                k2[i, j] += ck.C21 * k1[i, j] * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k2[i, k_lu]
-                    k2[i, k_lu] = k2[i, piv_k]
-                    k2[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k2[i, k_lu] -= lu_mat[i, k_lu, col] * k2[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k2[i, k_lu] -= lu_mat[i, k_lu, col] * k2[i, col]
-                k2[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                b_offset = batch * n_vars
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] = y[i, j] + ck.A21 * k1[i, j]
+                    ode_fn(u, smem_t[batch] + ck.C2 * smem_dt_use[batch], params, k2, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k2[i, j] + ck.C21 * k1[i, j] * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k2[i, j] = smem_rhs[b_offset + j]
 
             # ---- Stage 3 ----
-            for j in range(n_vars):
-                u[i, j] = y[i, j] + (ck.A31 * k1[i, j] + ck.A32 * k2[i, j])
-            ode_fn(u, t + ck.C3 * dt_use, params, k3, i)
-            for j in range(n_vars):
-                k3[i, j] += (ck.C31 * k1[i, j] + ck.C32 * k2[i, j]) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k3[i, k_lu]
-                    k3[i, k_lu] = k3[i, piv_k]
-                    k3[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k3[i, k_lu] -= lu_mat[i, k_lu, col] * k3[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k3[i, k_lu] -= lu_mat[i, k_lu, col] * k3[i, col]
-                k3[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                b_offset = batch * n_vars
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] = y[i, j] + (ck.A31 * k1[i, j] + ck.A32 * k2[i, j])
+                    ode_fn(u, smem_t[batch] + ck.C3 * smem_dt_use[batch], params, k3, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k3[i, j]
+                            + (ck.C31 * k1[i, j] + ck.C32 * k2[i, j])
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k3[i, j] = smem_rhs[b_offset + j]
 
             # ---- Stage 4 ----
-            for j in range(n_vars):
-                u[i, j] = y[i, j] + (
-                    ck.A41 * k1[i, j] + ck.A42 * k2[i, j] + ck.A43 * k3[i, j]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
                 )
-            ode_fn(u, t + ck.C4 * dt_use, params, k4, i)
-            for j in range(n_vars):
-                k4[i, j] += (
-                    ck.C41 * k1[i, j] + ck.C42 * k2[i, j] + ck.C43 * k3[i, j]
-                ) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k4[i, k_lu]
-                    k4[i, k_lu] = k4[i, piv_k]
-                    k4[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k4[i, k_lu] -= lu_mat[i, k_lu, col] * k4[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k4[i, k_lu] -= lu_mat[i, k_lu, col] * k4[i, col]
-                k4[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+                b_offset = batch * n_vars
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] = y[i, j] + (
+                            ck.A41 * k1[i, j] + ck.A42 * k2[i, j] + ck.A43 * k3[i, j]
+                        )
+                    ode_fn(u, smem_t[batch] + ck.C4 * smem_dt_use[batch], params, k4, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k4[i, j]
+                            + (
+                                ck.C41 * k1[i, j]
+                                + ck.C42 * k2[i, j]
+                                + ck.C43 * k3[i, j]
+                            )
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k4[i, j] = smem_rhs[b_offset + j]
 
             # ---- Stage 5 ----
-            for j in range(n_vars):
-                u[i, j] = y[i, j] + (
-                    ck.A51 * k1[i, j]
-                    + ck.A52 * k2[i, j]
-                    + ck.A53 * k3[i, j]
-                    + ck.A54 * k4[i, j]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
                 )
-            ode_fn(u, t + ck.C5 * dt_use, params, k5, i)
-            for j in range(n_vars):
-                k5[i, j] += (
-                    ck.C51 * k1[i, j]
-                    + ck.C52 * k2[i, j]
-                    + ck.C53 * k3[i, j]
-                    + ck.C54 * k4[i, j]
-                ) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k5[i, k_lu]
-                    k5[i, k_lu] = k5[i, piv_k]
-                    k5[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k5[i, k_lu] -= lu_mat[i, k_lu, col] * k5[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k5[i, k_lu] -= lu_mat[i, k_lu, col] * k5[i, col]
-                k5[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+                b_offset = batch * n_vars
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] = y[i, j] + (
+                            ck.A51 * k1[i, j]
+                            + ck.A52 * k2[i, j]
+                            + ck.A53 * k3[i, j]
+                            + ck.A54 * k4[i, j]
+                        )
+                    ode_fn(u, smem_t[batch] + ck.C5 * smem_dt_use[batch], params, k5, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k5[i, j]
+                            + (
+                                ck.C51 * k1[i, j]
+                                + ck.C52 * k2[i, j]
+                                + ck.C53 * k3[i, j]
+                                + ck.C54 * k4[i, j]
+                            )
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k5[i, j] = smem_rhs[b_offset + j]
 
             # ---- Stage 6 ----
-            for j in range(n_vars):
-                u[i, j] = y[i, j] + (
-                    ck.A61 * k1[i, j]
-                    + ck.A62 * k2[i, j]
-                    + ck.A63 * k3[i, j]
-                    + ck.A64 * k4[i, j]
-                    + ck.A65 * k5[i, j]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
                 )
-            ode_fn(u, t_end, params, k6, i)
-            for j in range(n_vars):
-                k6[i, j] += (
-                    ck.C61 * k1[i, j]
-                    + ck.C62 * k2[i, j]
-                    + ck.C63 * k3[i, j]
-                    + ck.C64 * k4[i, j]
-                    + ck.C65 * k5[i, j]
-                ) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k6[i, k_lu]
-                    k6[i, k_lu] = k6[i, piv_k]
-                    k6[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k6[i, k_lu] -= lu_mat[i, k_lu, col] * k6[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k6[i, k_lu] -= lu_mat[i, k_lu, col] * k6[i, col]
-                k6[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+                b_offset = batch * n_vars
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] = y[i, j] + (
+                            ck.A61 * k1[i, j]
+                            + ck.A62 * k2[i, j]
+                            + ck.A63 * k3[i, j]
+                            + ck.A64 * k4[i, j]
+                            + ck.A65 * k5[i, j]
+                        )
+                    ode_fn(u, smem_t_end[batch], params, k6, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k6[i, j]
+                            + (
+                                ck.C61 * k1[i, j]
+                                + ck.C62 * k2[i, j]
+                                + ck.C63 * k3[i, j]
+                                + ck.C64 * k4[i, j]
+                                + ck.C65 * k5[i, j]
+                            )
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k6[i, j] = smem_rhs[b_offset + j]
 
-            # u = u6 + k6  (now u7)
-            for j in range(n_vars):
-                u[i, j] += k6[i, j]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] += k6[i, j]
 
             # ---- Stage 7 ----
-            ode_fn(u, t_end, params, k7, i)
-            for j in range(n_vars):
-                k7[i, j] += (
-                    ck.C71 * k1[i, j]
-                    + ck.C72 * k2[i, j]
-                    + ck.C73 * k3[i, j]
-                    + ck.C74 * k4[i, j]
-                    + ck.C75 * k5[i, j]
-                    + ck.C76 * k6[i, j]
-                ) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k7[i, k_lu]
-                    k7[i, k_lu] = k7[i, piv_k]
-                    k7[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k7[i, k_lu] -= lu_mat[i, k_lu, col] * k7[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k7[i, k_lu] -= lu_mat[i, k_lu, col] * k7[i, col]
-                k7[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                b_offset = batch * n_vars
+                if active:
+                    ode_fn(u, smem_t_end[batch], params, k7, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k7[i, j]
+                            + (
+                                ck.C71 * k1[i, j]
+                                + ck.C72 * k2[i, j]
+                                + ck.C73 * k3[i, j]
+                                + ck.C74 * k4[i, j]
+                                + ck.C75 * k5[i, j]
+                                + ck.C76 * k6[i, j]
+                            )
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k7[i, j] = smem_rhs[b_offset + j]
 
-            # u = u7 + k7  (now u8)
-            for j in range(n_vars):
-                u[i, j] += k7[i, j]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                if active:
+                    for j in range(n_vars):
+                        u[i, j] += k7[i, j]
 
             # ---- Stage 8 ----
-            ode_fn(u, t_end, params, k8, i)
-            for j in range(n_vars):
-                k8[i, j] += (
-                    ck.C81 * k1[i, j]
-                    + ck.C82 * k2[i, j]
-                    + ck.C83 * k3[i, j]
-                    + ck.C84 * k4[i, j]
-                    + ck.C85 * k5[i, j]
-                    + ck.C86 * k6[i, j]
-                    + ck.C87 * k7[i, j]
-                ) * inv_dt
-            for k_lu in range(n_vars):
-                piv_k = piv_arr[i, k_lu]
-                if piv_k != k_lu:
-                    tmp = k8[i, k_lu]
-                    k8[i, k_lu] = k8[i, piv_k]
-                    k8[i, piv_k] = tmp
-            for k_lu in range(1, n_vars):
-                for col in range(k_lu):
-                    k8[i, k_lu] -= lu_mat[i, k_lu, col] * k8[i, col]
-            for k_lu in range(n_vars - 1, -1, -1):
-                for col in range(k_lu + 1, n_vars):
-                    k8[i, k_lu] -= lu_mat[i, k_lu, col] * k8[i, col]
-                k8[i, k_lu] /= lu_mat[i, k_lu, k_lu]
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                b_offset = batch * n_vars
+                if active:
+                    ode_fn(u, smem_t_end[batch], params, k8, i)
+                    for j in range(n_vars):
+                        smem_rhs[b_offset + j] = (
+                            k8[i, j]
+                            + (
+                                ck.C81 * k1[i, j]
+                                + ck.C82 * k2[i, j]
+                                + ck.C83 * k3[i, j]
+                                + ck.C84 * k4[i, j]
+                                + ck.C85 * k5[i, j]
+                                + ck.C86 * k6[i, j]
+                                + ck.C87 * k7[i, j]
+                            )
+                            * smem_inv_dt[batch]
+                        )
+            cuda.syncthreads()
+            lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
+            cuda.syncthreads()
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                b_offset = batch * n_vars
+                if i < y0.shape[0]:
+                    for j in range(n_vars):
+                        k8[i, j] = smem_rhs[b_offset + j]
 
-            # Error estimate = k8; y_new = u8 + k8
-            err_sum = 0.0
-            for j in range(n_vars):
-                y_new_j = u[i, j] + k8[i, j]
-                scale = atol + rtol * max(math.fabs(y[i, j]), math.fabs(y_new_j))
-                ratio = k8[i, j] / scale
-                err_sum += ratio * ratio
-            err_norm = math.sqrt(err_sum / n_vars)
-            accept = err_norm <= 1.0 and not math.isnan(err_norm)
+            if tx < batches_per_block:
+                batch = tx
+                i = block_start + batch
+                active = (
+                    i < y0.shape[0]
+                    and smem_save_idx[batch] < n_save
+                    and smem_t[batch] < tf
+                    and smem_n_steps[batch] < max_steps
+                )
+                if active:
+                    err_sum = 0.0
+                    for j in range(n_vars):
+                        y_new_j = u[i, j] + k8[i, j]
+                        scale = atol + rtol * max(
+                            math.fabs(y[i, j]), math.fabs(y_new_j)
+                        )
+                        ratio = k8[i, j] / scale
+                        err_sum += ratio * ratio
+                    err_norm = math.sqrt(err_sum / n_vars)
+                    accept = err_norm <= 1.0 and not math.isnan(err_norm)
 
-            t_new = t
-            if accept:
-                t_new = t + dt_use
-                for j in range(n_vars):
-                    y[i, j] = u[i, j] + k8[i, j]
-                accepted_steps += 1
-            else:
-                rejected_steps += 1
+                    t_new = smem_t[batch]
+                    if accept:
+                        t_new = smem_t[batch] + smem_dt_use[batch]
+                        for j in range(n_vars):
+                            y[i, j] = u[i, j] + k8[i, j]
+                        smem_accepted[batch] += 1
+                    else:
+                        smem_rejected[batch] += 1
 
-            reached = accept and (
-                abs(t_new - next_target) <= 1e-12 * max(1.0, abs(next_target))
-            )
-            if reached:
-                for j in range(n_vars):
-                    hist[i, save_idx, j] = y[i, j]
-                save_idx += 1
+                    reached = accept and (
+                        abs(t_new - smem_next_target[batch])
+                        <= 1e-12 * max(1.0, abs(smem_next_target[batch]))
+                    )
+                    if reached:
+                        for j in range(n_vars):
+                            hist[i, smem_save_idx[batch], j] = y[i, j]
+                        smem_save_idx[batch] += 1
 
-            if math.isnan(err_norm) or err_norm > 1e18:
-                safe_err = 1e18
-            elif err_norm == 0.0:
-                safe_err = 1e-18
-            else:
-                safe_err = err_norm
-            factor = ck.SAFETY * safe_err ** (-1.0 / 6.0)
-            if factor < ck.FACTOR_MIN:
-                factor = ck.FACTOR_MIN
-            elif factor > ck.FACTOR_MAX:
-                factor = ck.FACTOR_MAX
-            dt = dt_use * factor
-            t = t_new
-            n_steps += 1
+                    if math.isnan(err_norm) or err_norm > 1e18:
+                        safe_err = 1e18
+                    elif err_norm == 0.0:
+                        safe_err = 1e-18
+                    else:
+                        safe_err = err_norm
+                    factor = ck.SAFETY * safe_err ** (-1.0 / 6.0)
+                    if factor < ck.FACTOR_MIN:
+                        factor = ck.FACTOR_MIN
+                    elif factor > ck.FACTOR_MAX:
+                        factor = ck.FACTOR_MAX
+                    smem_dt[batch] = smem_dt_use[batch] * factor
+                    smem_t[batch] = t_new
+                    smem_n_steps[batch] += 1
 
-        accepted_out[i] = accepted_steps
-        rejected_out[i] = rejected_steps
-        loop_out[i] = n_steps
+            cuda.syncthreads()
+            if tx == 0:
+                keep_going = 0
+                for batch in range(batches_per_block):
+                    i = block_start + batch
+                    if (
+                        i < y0.shape[0]
+                        and smem_save_idx[batch] < n_save
+                        and smem_t[batch] < tf
+                        and smem_n_steps[batch] < max_steps
+                    ):
+                        keep_going = 1
+                smem_continue[0] = keep_going
+            cuda.syncthreads()
 
-    return kernel
+        if tx < batches_per_block:
+            i = block_start + tx
+            if i < y0.shape[0]:
+                accepted_out[i] = smem_accepted[tx]
+                rejected_out[i] = smem_rejected[tx]
+                loop_out[i] = smem_n_steps[tx]
+
+    return kernel, lu_solver
 
 
 def solve(
@@ -376,12 +578,13 @@ def solve(
 
     flat_work = [cuda.device_array((n, n_vars), dtype=np.float64) for _ in range(10)]
     jac_dev = cuda.device_array((n, n_vars, n_vars), dtype=np.float64)
-    lu_dev = cuda.device_array((n, n_vars, n_vars), dtype=np.float64)
-    piv_dev = cuda.device_array((n, n_vars), dtype=np.int32)
 
-    threads = 128
-    blocks = (n + threads - 1) // threads
-    _make_kernel(ode_fn, jac_fn, n_vars)[blocks, threads](
+    kernel, lu_solver = _make_kernel(ode_fn, jac_fn, n_vars)
+    threads = _as_launch_block_dim(lu_solver.block_dim)
+    blocks = (n + int(lu_solver.batches_per_block) - 1) // int(
+        lu_solver.batches_per_block
+    )
+    kernel[blocks, threads](
         cuda.to_device(y0_arr),
         cuda.to_device(times),
         cuda.to_device(params_arr),
@@ -395,8 +598,6 @@ def solve(
         loop_dev,
         *flat_work,  # y, u, k1..k8
         jac_dev,
-        lu_dev,
-        piv_dev,
     )
     cuda.synchronize()
 
