@@ -29,7 +29,7 @@ def _as_launch_block_dim(block_dim):
 def _make_kernel(ode_fn, jac_fn, n_vars: int):
     lu_solver = LUPivotSolver(
         size=(n_vars, n_vars, 1),
-        precision=np.float64,
+        precision=np.float32,
         execution="Block",
         arrangement=("row_major", "row_major"),
         batches_per_block="suggested",
@@ -39,7 +39,9 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
     a_size = int(lu_solver.a_size())
     b_size = int(lu_solver.b_size())
     ipiv_size = int(lu_solver.ipiv_size)
-    print(f"Using {batches_per_block=} and {lu_solver.block_dim=} for LU solver.")
+    print(
+        f"Rodas5ckn kernel: n_vars={n_vars}, batches_per_block={batches_per_block}, block_dim={lu_solver.block_dim}, a_size={a_size}, b_size={b_size}, ipiv_size={ipiv_size}"
+    )
 
     @cuda.jit
     def kernel(
@@ -72,8 +74,8 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
         n_save = times.shape[0]
         tf = times[n_save - 1]
 
-        smem_lu = cuda.shared.array(shape=a_size, dtype=np.float64)
-        smem_rhs = cuda.shared.array(shape=b_size, dtype=np.float64)
+        smem_lu = cuda.shared.array(shape=a_size, dtype=np.float32)
+        smem_rhs = cuda.shared.array(shape=b_size, dtype=np.float32)
         smem_ipiv = cuda.shared.array(shape=ipiv_size, dtype=np.int32)
         smem_info = cuda.shared.array(shape=batches_per_block, dtype=np.int32)
 
@@ -141,13 +143,13 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                     for row in range(n_vars):
                         for col in range(n_vars):
                             if row == col:
-                                smem_lu[a_offset + row * n_vars + col] = (
+                                smem_lu[a_offset + row * n_vars + col] = np.float32(
                                     dtgamma_inv - jac[i, row, col]
                                 )
                             else:
-                                smem_lu[a_offset + row * n_vars + col] = -jac[
-                                    i, row, col
-                                ]
+                                smem_lu[a_offset + row * n_vars + col] = np.float32(
+                                    -jac[i, row, col]
+                                )
                 else:
                     for row in range(n_vars):
                         for col in range(n_vars):
@@ -175,7 +177,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 if active:
                     ode_fn(y, smem_t[batch], params, k1, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = k1[i, j]
+                        smem_rhs[b_offset + j] = np.float32(k1[i, j])
             cuda.syncthreads()
             lu_solver.solve(smem_lu, smem_ipiv, smem_rhs)
             cuda.syncthreads()
@@ -185,7 +187,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k1[i, j] = smem_rhs[b_offset + j]
+                        k1[i, j] = np.float64(smem_rhs[b_offset + j])
 
             # ---- Stage 2 ----
             if tx < batches_per_block:
@@ -203,7 +205,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                         u[i, j] = y[i, j] + ck.A21 * k1[i, j]
                     ode_fn(u, smem_t[batch] + ck.C2 * smem_dt_use[batch], params, k2, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k2[i, j] + ck.C21 * k1[i, j] * smem_inv_dt[batch]
                         )
             cuda.syncthreads()
@@ -215,7 +217,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k2[i, j] = smem_rhs[b_offset + j]
+                        k2[i, j] = np.float64(smem_rhs[b_offset + j])
 
             # ---- Stage 3 ----
             if tx < batches_per_block:
@@ -233,7 +235,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                         u[i, j] = y[i, j] + (ck.A31 * k1[i, j] + ck.A32 * k2[i, j])
                     ode_fn(u, smem_t[batch] + ck.C3 * smem_dt_use[batch], params, k3, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k3[i, j]
                             + (ck.C31 * k1[i, j] + ck.C32 * k2[i, j])
                             * smem_inv_dt[batch]
@@ -247,7 +249,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k3[i, j] = smem_rhs[b_offset + j]
+                        k3[i, j] = np.float64(smem_rhs[b_offset + j])
 
             # ---- Stage 4 ----
             if tx < batches_per_block:
@@ -267,7 +269,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                         )
                     ode_fn(u, smem_t[batch] + ck.C4 * smem_dt_use[batch], params, k4, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k4[i, j]
                             + (
                                 ck.C41 * k1[i, j]
@@ -285,7 +287,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k4[i, j] = smem_rhs[b_offset + j]
+                        k4[i, j] = np.float64(smem_rhs[b_offset + j])
 
             # ---- Stage 5 ----
             if tx < batches_per_block:
@@ -308,7 +310,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                         )
                     ode_fn(u, smem_t[batch] + ck.C5 * smem_dt_use[batch], params, k5, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k5[i, j]
                             + (
                                 ck.C51 * k1[i, j]
@@ -327,7 +329,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k5[i, j] = smem_rhs[b_offset + j]
+                        k5[i, j] = np.float64(smem_rhs[b_offset + j])
 
             # ---- Stage 6 ----
             if tx < batches_per_block:
@@ -351,7 +353,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                         )
                     ode_fn(u, smem_t_end[batch], params, k6, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k6[i, j]
                             + (
                                 ck.C61 * k1[i, j]
@@ -371,7 +373,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k6[i, j] = smem_rhs[b_offset + j]
+                        k6[i, j] = np.float64(smem_rhs[b_offset + j])
 
             if tx < batches_per_block:
                 batch = tx
@@ -400,7 +402,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 if active:
                     ode_fn(u, smem_t_end[batch], params, k7, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k7[i, j]
                             + (
                                 ck.C71 * k1[i, j]
@@ -421,7 +423,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k7[i, j] = smem_rhs[b_offset + j]
+                        k7[i, j] = np.float64(smem_rhs[b_offset + j])
 
             if tx < batches_per_block:
                 batch = tx
@@ -450,7 +452,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 if active:
                     ode_fn(u, smem_t_end[batch], params, k8, i)
                     for j in range(n_vars):
-                        smem_rhs[b_offset + j] = (
+                        smem_rhs[b_offset + j] = np.float32(
                             k8[i, j]
                             + (
                                 ck.C81 * k1[i, j]
@@ -472,7 +474,7 @@ def _make_kernel(ode_fn, jac_fn, n_vars: int):
                 b_offset = batch * n_vars
                 if i < y0.shape[0]:
                     for j in range(n_vars):
-                        k8[i, j] = smem_rhs[b_offset + j]
+                        k8[i, j] = np.float64(smem_rhs[b_offset + j])
 
             if tx < batches_per_block:
                 batch = tx
