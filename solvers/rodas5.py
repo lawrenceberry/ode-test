@@ -15,6 +15,8 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
+from solvers._jax_solver_common import normalize_inputs, solve_adaptive_ensemble
+
 # fmt: off
 # Rodas5 W-transformed coefficients
 _gamma = 0.19
@@ -109,53 +111,15 @@ def solve(
     lu_dtype = jnp.float32 if lu_precision == "fp32" else jnp.float64
     jac_fn = jax.jacfwd(ode_fn, argnums=0)
 
-    y0_in = jnp.asarray(y0, dtype=jnp.float64)
-    params_arr = jnp.asarray(params)
-    times = jnp.asarray(t_span, dtype=jnp.float64)
-
-    if y0_in.ndim == 1 and params_arr.ndim == 1:
-        N = 1
-        n_vars = y0_in.shape[0]
-        y0_arr = jnp.broadcast_to(y0_in, (N, n_vars))
-        params_arr = jnp.broadcast_to(params_arr, (N, params_arr.shape[0]))
-    elif y0_in.ndim == 1:
-        N = params_arr.shape[0]
-        n_vars = y0_in.shape[0]
-        y0_arr = jnp.broadcast_to(y0_in, (N, n_vars))
-    else:
-        N = y0_in.shape[0]
-        n_vars = y0_in.shape[1]
-        y0_arr = y0_in
-        if params_arr.ndim == 1:
-            params_arr = jnp.broadcast_to(params_arr, (N, params_arr.shape[0]))
-        elif params_arr.shape[0] != N:
-            raise ValueError(
-                "params must have shape (n_params,) or (N, n_params) when y0 has "
-                f"shape (N, n_vars); got y0.shape={y0_in.shape} and "
-                f"params.shape={params_arr.shape}"
-            )
-    n_save = times.shape[0]
-    tf = times[-1]
-
-    dt0 = jnp.float64(
-        first_step if first_step is not None else (times[-1] - times[0]) * 1e-6
+    y0_arr, times, params_arr, _, n_vars, _, dt0, bs, n_chunks = normalize_inputs(
+        y0, t_span, params, first_step, batch_size
     )
-
-    bs = N if batch_size is None else batch_size
-    n_chunks = (N + bs - 1) // bs
 
     eye = jnp.eye(n_vars, dtype=lu_dtype)
 
-    def _solve_one(params_one, y0_one):
-        y_init = y0_one.copy()
-        hist_init = jnp.zeros((n_save, n_vars), dtype=jnp.float64).at[0, :].set(y_init)
-        t_init = times[0]
-        dt_init = dt0
-        save_idx_init = jnp.int32(1)
-        accepted_steps_init = jnp.int32(0)
-        rejected_steps_init = jnp.int32(0)
-
-        def _step_one(y, t, dt):
+    def step_factory(params_one):
+        def _step_one(y, t, dt, extra):
+            del extra
             jac = jac_fn(y, t, params_one).astype(lu_dtype)
             dtgamma_inv = (1.0 / (dt * _gamma)).astype(lu_dtype)
             lu = jax.scipy.linalg.lu_factor(dtgamma_inv * eye - jac)
@@ -226,116 +190,24 @@ def solve(
                 * inv_dt
             )
 
-            return u + k8, k8
+            return u + k8, k8, jnp.bool_(False), ()
 
-        def cond_fn(state):
-            t, _, _, _, save_idx, n_steps, _, _ = state
-            return (save_idx < n_save) & (t < tf) & (n_steps < max_steps)
+        return _step_one, (), lambda extra, candidate, accept: extra
 
-        def body_fn(state):
-            (
-                t,
-                y,
-                dt,
-                hist,
-                save_idx,
-                n_steps,
-                accepted_steps,
-                rejected_steps,
-            ) = state
-            next_target = times[save_idx]
-            dt_use = jnp.maximum(jnp.minimum(dt, next_target - t), 1e-30)
-
-            y_new, err_est = _step_one(y, t, dt_use)
-
-            scale = atol + rtol * jnp.maximum(jnp.abs(y), jnp.abs(y_new))
-            err_norm = jnp.sqrt(jnp.mean((err_est / scale) ** 2))
-
-            accept = (err_norm <= 1.0) & ~jnp.isnan(err_norm)
-            t_new = jnp.where(accept, t + dt_use, t)
-            y_out = jnp.where(accept, y_new, y)
-
-            reached = accept & (
-                jnp.abs(t_new - next_target)
-                <= 1e-12 * jnp.maximum(1.0, jnp.abs(next_target))
-            )
-            slot_mask = jax.nn.one_hot(save_idx, n_save, dtype=jnp.bool_) & reached
-            hist_new = jnp.where(slot_mask[:, None], y_out[None, :], hist)
-            save_idx_new = save_idx + reached.astype(jnp.int32)
-
-            safe_err = jnp.where(
-                jnp.isnan(err_norm) | (err_norm > 1e18),
-                1e18,
-                jnp.where(err_norm == 0.0, 1e-18, err_norm),
-            )
-            factor = jnp.clip(0.9 * safe_err ** (-1.0 / 6.0), 0.2, 6.0)
-            dt_new = dt_use * factor
-            rejected = ~accept
-            accepted_steps_new = accepted_steps + accept.astype(jnp.int32)
-            rejected_steps_new = rejected_steps + rejected.astype(jnp.int32)
-
-            return (
-                t_new,
-                y_out,
-                dt_new,
-                hist_new,
-                save_idx_new,
-                n_steps + 1,
-                accepted_steps_new,
-                rejected_steps_new,
-            )
-
-        init = (
-            t_init,
-            y_init,
-            dt_init,
-            hist_init,
-            save_idx_init,
-            jnp.int32(0),
-            accepted_steps_init,
-            rejected_steps_init,
-        )
-        (
-            _,
-            _,
-            _,
-            hist_final,
-            _,
-            loop_steps,
-            accepted_steps,
-            rejected_steps,
-        ) = jax.lax.while_loop(cond_fn, body_fn, init)
-        stats = {
-            "accepted_steps": accepted_steps,
-            "rejected_steps": rejected_steps,
-            "loop_steps": loop_steps,
-        }
-        return hist_final, stats
-
-    results, trajectory_stats = jax.lax.map(
-        lambda xs: _solve_one(*xs),
-        (params_arr, y0_arr),
+    return solve_adaptive_ensemble(
+        params_arr=params_arr,
+        y0_arr=y0_arr,
+        times=times,
+        dt0=dt0,
         batch_size=bs,
+        n_chunks=n_chunks,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        return_stats=return_stats,
+        step_factory=step_factory,
+        error_exponent=-1.0 / 6.0,
+        safety=0.9,
+        factor_min=0.2,
+        factor_max=6.0,
     )
-    solution = results
-    if not return_stats:
-        return solution
-
-    accepted_steps = trajectory_stats["accepted_steps"].reshape(N)
-    rejected_steps = trajectory_stats["rejected_steps"].reshape(N)
-    n_padded = n_chunks * bs
-    pad_count = n_padded - N
-    loop_steps_padded = jnp.pad(trajectory_stats["loop_steps"], (0, pad_count))
-    loop_steps = loop_steps_padded.reshape(n_chunks, bs)
-    valid_batches = (jnp.arange(n_padded) < N).reshape(n_chunks, bs)
-    batch_loop_iterations = jnp.max(
-        jnp.where(valid_batches, loop_steps, jnp.int32(0)), axis=1
-    )
-    valid_lanes = jnp.sum(valid_batches.astype(jnp.int32), axis=1)
-    stats = {
-        "accepted_steps": accepted_steps,
-        "rejected_steps": rejected_steps,
-        "batch_loop_iterations": batch_loop_iterations,
-        "valid_lanes": valid_lanes,
-    }
-    return solution, stats
